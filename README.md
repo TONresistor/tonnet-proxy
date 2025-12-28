@@ -16,7 +16,14 @@
 
 ## Overview
 
-Access `.ton`, `.adnl`, and `.t.me` sites anonymously through 3-hop encrypted circuits. No single relay knows both who you are and what you access.
+Tonnet Proxy is an anonymous proxy that enables private, anonymous access to TON Sites through multi-hop garlic routing. Like Tor for the TON Network, each relay only knows its immediate neighbors, never the full path.
+
+Built natively on TON protocols (ADNL, RLDP, DHT), it provides:
+
+- **True anonymity**: no single relay knows both source and destination
+- **Layered encryption**: ChaCha20-Poly1305 at each hop, X25519 key exchange
+- **Decentralized**: run your own relay, strengthen the network
+- **TON-native**: direct integration with TON DNS and RLDP HTTP
 
 ## Installation
 
