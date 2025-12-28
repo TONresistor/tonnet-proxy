@@ -1,17 +1,22 @@
+<div align="center">
+
 # Tonnet Proxy
 
-Private gateway to TON sites. Access `.ton`, `.adnl`, and `.t.me` domains anonymously through encrypted multi-hop circuits.
+[![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![TON](https://img.shields.io/badge/TON-Network-0088CC?logo=telegram)](https://ton.org/)
 
-## How It Works
+**Private gateway to TON sites**
 
-```
-You -> [Encrypted] -> Entry -> Middle -> Exit -> TON Site
-              |          |        |        |
-           3 layers   sees IP  sees     sees dest
-           of crypto  only    nothing   only
-```
+[Installation](#installation) · [Usage](#usage) · [Options](#options)
 
-Your traffic is encrypted in 3 layers and routed through 3 relays. No single node can link you to your destination.
+</div>
+
+---
+
+## Overview
+
+Access `.ton`, `.adnl`, and `.t.me` sites anonymously through 3-hop encrypted circuits. No single relay knows both who you are and what you access.
 
 ## Installation
 
@@ -27,33 +32,21 @@ curl -L https://github.com/TONresistor/tonnet-proxy/releases/latest/download/ton
 chmod +x tonnet-proxy
 ```
 
-**From Source:**
-```bash
-git clone https://github.com/TONresistor/tonnet-proxy.git
-cd tonnet-proxy
-make build
-```
-
 ## Usage
 
 ```bash
-# Auto-select relays
 ./tonnet-proxy --auto
-
-# With circuit rotation
-./tonnet-proxy --auto --rotate
 ```
 
-Configure your browser to use `http://localhost:8080` as HTTP proxy.
+Configure browser to use `http://localhost:8080` as proxy.
 
 ## Options
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--auto` | Auto-select relays from directory | - |
-| `--rotate` | Circuit rotation interval | 10m |
-| `--listen` | Local proxy address | :8080 |
-| `--retries` | Circuit build attempts | 3 |
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--auto` | - | Auto-select relays |
+| `--rotate` | 10m | Circuit rotation |
+| `--listen` | :8080 | Proxy address |
 
 ## Related
 
