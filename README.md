@@ -196,7 +196,7 @@ Contributions are welcome!
 
 ## Related
 
-- [tonnet-relay](https://github.com/TONresistor/tonnet-relay) - Run a relay node
+- [tonnet-relayer](https://github.com/TONresistor/tonnet-relayer) - Run a relay node
 
 ## License
 
