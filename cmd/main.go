@@ -439,7 +439,7 @@ func run(cmd *cobra.Command, args []string) {
 		fmt.Printf("Circuit rotation: every %s\n", rotateInterval)
 	}
 
-	fmt.Printf("Proxy listening on http://localhost%s\n", listen)
+	fmt.Printf("Proxy listening on http://%s\n", listen)
 	fmt.Println()
 
 	// Create proxy handler
@@ -510,7 +510,7 @@ Then configure your browser to use http://localhost:8080 as HTTP proxy.`,
 	rootCmd.Flags().String("relay1", "", "Entry relay (format: ip:port,pubkey_hex)")
 	rootCmd.Flags().String("relay2", "", "Middle relay (format: ip:port,pubkey_hex)")
 	rootCmd.Flags().String("relay3", "", "Exit relay (format: ip:port,pubkey_hex)")
-	rootCmd.Flags().String("listen", ":8080", "Local proxy listen address")
+	rootCmd.Flags().String("listen", "127.0.0.1:8080", "Proxy listen address (use 0.0.0.0:PORT for network access)")
 	rootCmd.Flags().Bool("auto", false, "Auto-select relays from community directory")
 	rootCmd.Flags().Bool("direct", false, "Direct connection mode (no anonymity, faster)")
 	rootCmd.Flags().String("config", "", "TON network config file or URL (default: auto-download)")
