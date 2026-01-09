@@ -194,6 +194,22 @@ func (c *DirectClient) processRequest(ctx context.Context, s *stream) {
 	}
 	defer resp.Body.Close()
 
+	// Read full body to fix Content-Length mismatch from tonutils-go bug
+	// (tonutils copies request Content-Length to response Content-Length)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		s.sendError(fmt.Sprintf("read response body: %v", err))
+		return
+	}
+
+	// Reset response metadata and set correct Content-Length
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	resp.TransferEncoding = nil
+	resp.Header.Del("Content-Length")
+	resp.Header.Del("Transfer-Encoding")
+	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
+
 	// Serialize response
 	var respBuf bytes.Buffer
 	if err := resp.Write(&respBuf); err != nil {
