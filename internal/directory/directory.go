@@ -7,11 +7,16 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
-	"github.com/TONresistor/tonnet-proxy/internal/client"
+	"github.com/adnl-network/adnl-proxy/internal/client"
 )
+
+// maxDirectoryBodySize limits the response body read from the directory server
+// to prevent memory exhaustion from a malicious or misconfigured server.
+const maxDirectoryBodySize = 10 * 1024 * 1024 // 10 MB
 
 // DefaultURL is the community relay directory
 const DefaultURL = "https://raw.githubusercontent.com/TONresistor/tonnet-directory/main/relays.json"
@@ -77,7 +82,7 @@ func Fetch(url string) (*Directory, error) {
 	}
 
 	var dir Directory
-	if err := json.NewDecoder(resp.Body).Decode(&dir); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxDirectoryBodySize)).Decode(&dir); err != nil {
 		return nil, fmt.Errorf("parse directory: %w", err)
 	}
 

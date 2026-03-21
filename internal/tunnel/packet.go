@@ -54,6 +54,16 @@ func generateRandomPadding(minSize, maxSize int) []byte {
 	return padding
 }
 
+// tlBytesLen returns the number of bytes that writeBytes() will write for n
+// bytes of payload. For n < 254, writeBytes uses a 1-byte length prefix, so
+// the total is aligned_to_4(1 + n). For n >= 254 it uses a 4-byte prefix.
+func tlBytesLen(n int) int {
+	if n < 254 {
+		return alignedLen(1 + n)
+	}
+	return alignedLen(4 + n)
+}
+
 // Serialize converts the packet contents to bytes (TL boxed format with constructor ID)
 func (p *TunnelPacketContents) Serialize() ([]byte, error) {
 	// Generate random padding if not set
@@ -67,9 +77,8 @@ func (p *TunnelPacketContents) Serialize() ([]byte, error) {
 	// Calculate size
 	size := 4 // TL constructor ID
 
-	// rand1: length prefix (4 bytes) + data + alignment
-	rand1Aligned := alignedLen(len(p.Rand1))
-	size += 4 + rand1Aligned
+	// rand1: TL bytes field (length prefix + data + alignment padding)
+	size += tlBytesLen(len(p.Rand1))
 
 	// flags
 	size += 4
@@ -79,20 +88,19 @@ func (p *TunnelPacketContents) Serialize() ([]byte, error) {
 	}
 
 	if p.Flags&FlagHasMessage != 0 {
-		size += 4 + alignedLen(len(p.Message))
+		size += tlBytesLen(len(p.Message))
 	}
 
 	if p.Flags&FlagHasStatistics != 0 {
-		size += 4 + alignedLen(len(p.Statistics))
+		size += tlBytesLen(len(p.Statistics))
 	}
 
 	if p.Flags&FlagHasPayment != 0 {
-		size += 4 + alignedLen(len(p.Payment))
+		size += tlBytesLen(len(p.Payment))
 	}
 
 	// rand2
-	rand2Aligned := alignedLen(len(p.Rand2))
-	size += 4 + rand2Aligned
+	size += tlBytesLen(len(p.Rand2))
 
 	buf := make([]byte, size)
 	offset := 0

@@ -31,7 +31,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version: '1.24'
 
       - name: Build
         env:
@@ -40,13 +40,13 @@ jobs:
           CGO_ENABLED: 0
         run: |
           VERSION=${GITHUB_REF#refs/tags/}
-          go build -ldflags "-X main.version=${VERSION} -s -w" -o tonnet-proxy-${{ matrix.suffix }} ./cmd/
+          go build -ldflags "-X main.version=${VERSION} -s -w" -o adnl-proxy-${{ matrix.suffix }} ./cmd/main.go
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tonnet-proxy-${{ matrix.suffix }}
-          path: tonnet-proxy-${{ matrix.suffix }}
+          name: adnl-proxy-${{ matrix.suffix }}
+          path: adnl-proxy-${{ matrix.suffix }}
 
   build-macos:
     runs-on: macos-latest
@@ -56,7 +56,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version: '1.24'
 
       - name: Build universal binary
         run: |
@@ -64,20 +64,20 @@ jobs:
           LDFLAGS="-X main.version=${VERSION} -s -w"
 
           # Build for both architectures
-          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o tonnet-proxy-darwin-amd64 ./cmd/
-          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags "${LDFLAGS}" -o tonnet-proxy-darwin-arm64 ./cmd/
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o adnl-proxy-darwin-amd64 ./cmd/main.go
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags "${LDFLAGS}" -o adnl-proxy-darwin-arm64 ./cmd/main.go
 
           # Create universal binary
-          lipo -create -output tonnet-proxy-darwin-universal tonnet-proxy-darwin-amd64 tonnet-proxy-darwin-arm64
+          lipo -create -output adnl-proxy-darwin-universal adnl-proxy-darwin-amd64 adnl-proxy-darwin-arm64
 
           # Verify
-          file tonnet-proxy-darwin-universal
+          file adnl-proxy-darwin-universal
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tonnet-proxy-darwin-universal
-          path: tonnet-proxy-darwin-universal
+          name: adnl-proxy-darwin-universal
+          path: adnl-proxy-darwin-universal
 
   release:
     needs: [build, build-macos]

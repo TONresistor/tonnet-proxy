@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"crypto/sha256"
+	"crypto/subtle"
 	"fmt"
 	"net"
 	"sync"
@@ -89,15 +90,15 @@ type ProxyFastImpl struct {
 	adnlStartTime int32
 }
 
-// NewProxyFast creates a new ProxyFast instance
-// sharedSecret MUST be exactly 32 bytes
+// NewProxyFast creates a new ProxyFast instance.
+// sharedSecret MUST be exactly 32 bytes; panics if not.
 func NewProxyFast(id [32]byte, sharedSecret []byte) *ProxyFastImpl {
-	var secret [32]byte
-	if len(sharedSecret) >= 32 {
-		copy(secret[:], sharedSecret[:32])
-	} else {
-		copy(secret[:], sharedSecret)
+	if len(sharedSecret) != 32 {
+		panic(fmt.Sprintf("NewProxyFast: sharedSecret must be exactly 32 bytes, got %d", len(sharedSecret)))
 	}
+
+	var secret [32]byte
+	copy(secret[:], sharedSecret)
 
 	return &ProxyFastImpl{
 		ID:            id,
@@ -232,8 +233,8 @@ func (p *ProxyFastImpl) Decrypt(data []byte) (*ProxyPacket, error) {
 	copy(signatureInput[32:], p.SharedSecret[:])
 	expectedSignature := sha256.Sum256(signatureInput[:])
 
-	// Step 5: Compare signatures
-	if receivedSignature != expectedSignature {
+	// Step 5: Compare signatures (constant-time to prevent timing attacks)
+	if subtle.ConstantTimeCompare(receivedSignature[:], expectedSignature[:]) != 1 {
 		return nil, ErrInvalidSignature
 	}
 

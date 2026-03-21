@@ -1,194 +1,41 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	cryptorand "crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"io"
-	"math/rand"
+	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
-	"sync"
+	"syscall"
 	"time"
 
-	"github.com/TONresistor/tonnet-proxy/internal/client"
-	"github.com/TONresistor/tonnet-proxy/internal/direct"
-	"github.com/TONresistor/tonnet-proxy/internal/directory"
+	"github.com/adnl-network/adnl-proxy/internal/client"
+	"github.com/adnl-network/adnl-proxy/internal/config"
+	"github.com/adnl-network/adnl-proxy/internal/direct"
+	"github.com/adnl-network/adnl-proxy/internal/directory"
+	"github.com/adnl-network/adnl-proxy/internal/logger"
+	"github.com/adnl-network/adnl-proxy/internal/proxy"
+	"github.com/adnl-network/adnl-proxy/internal/resolver"
 	"github.com/spf13/cobra"
 	"github.com/xssnick/tonutils-go/adnl"
 )
 
-var version = "dev"
+var version = "v0.6.0"
 
 const banner = `
-▗▄▄▄▖▗▄▖ ▗▖  ▗▖▗▖  ▗▖▗▄▄▄▖▗▄▄▄▖    ▗▄▄▖ ▗▄▄▖  ▗▄▖ ▗▖  ▗▖▗▖  ▗▖
-  █ ▐▌ ▐▌▐▛▚▖▐▌▐▛▚▖▐▌▐▌     █      ▐▌ ▐▌▐▌ ▐▌▐▌ ▐▌ ▝▚▞▘  ▝▚▞▘
-  █ ▐▌ ▐▌▐▌ ▝▜▌▐▌ ▝▜▌▐▛▀▀▘  █      ▐▛▀▘ ▐▛▀▚▖▐▌ ▐▌  ▐▌    ▐▌
-  █ ▝▚▄▞▘▐▌  ▐▌▐▌  ▐▌▐▙▄▄▖  █      ▐▌   ▐▌ ▐▌▝▚▄▞▘▗▞▘▝▚▖  ▐▌
-
-               Private Gateway to TON Sites
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ ▗▄▄▄▖▗▄▖ ▗▖  ▗▖▗▖  ▗▖▗▄▄▄▖▗▄▄▄▖    ▗▄▄▖ ▗▄▄▖  ▗▄▖ ▗▖  ▗▖▗▖  ▗▖  │
+    │   █ ▐▌ ▐▌▐▛▚▖▐▌▐▛▚▖▐▌▐▌     █      ▐▌ ▐▌▐▌ ▐▌▐▌ ▐▌ ▝▚▞▘  ▝▚▞▘   │
+    │   █ ▐▌ ▐▌▐▌ ▝▜▌▐▌ ▝▜▌▐▛▀▀▘  █      ▐▛▀▘ ▐▛▀▚▖▐▌ ▐▌  ▐▌    ▐▌    │
+    │   █ ▝▚▄▞▘▐▌  ▐▌▐▌  ▐▌▐▙▄▄▖  █      ▐▌   ▐▌ ▐▌▝▚▄▞▘▗▞▘▝▚▖  ▐▌    │
+    │                                                                 │
+    └───────────────────────@RESISTANCETOOLS──────────────────────────┘
 `
-
-// ProxyHandler handles HTTP requests and forwards them through the proxy backend
-type ProxyHandler struct {
-	backend   client.ProxyClient
-	backendMu sync.RWMutex
-
-	// Only used in circuit mode
-	gate           *adnl.Gateway
-	dir            *directory.Directory
-	rotateInterval time.Duration
-	retries        int
-	directMode     bool
-}
-
-// ServeHTTP handles incoming HTTP requests
-func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-
-	// Validate domain - only .ton, .adnl, .t.me supported
-	if !strings.HasSuffix(r.Host, ".ton") &&
-		!strings.HasSuffix(r.Host, ".adnl") &&
-		!strings.HasSuffix(r.Host, ".t.me") {
-		http.Error(w, "Only .ton, .adnl, .t.me domains supported", http.StatusBadRequest)
-		return
-	}
-
-	// Reject CONNECT method (no HTTPS support yet)
-	if r.Method == "CONNECT" {
-		http.Error(w, "HTTPS not supported yet", http.StatusNotImplemented)
-		return
-	}
-
-	// Capture backend reference for this request (rotation-safe)
-	h.backendMu.RLock()
-	backend := h.backend
-	h.backendMu.RUnlock()
-
-	// Build request path for logging
-	reqPath := r.Host + r.URL.Path
-	if r.URL.RawQuery != "" {
-		reqPath += "?" + r.URL.RawQuery
-	}
-
-	// Add timeout
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
-	defer cancel()
-
-	// 1. Open stream to the destination
-	streamID, err := backend.OpenStream(ctx, r.Host, 80)
-	if err != nil {
-		elapsed := time.Since(start)
-		fmt.Printf("[%s] %s %s - 502 (%.1fs) %v\n", time.Now().Format("15:04:05"), r.Method, reqPath, elapsed.Seconds(), err)
-		http.Error(w, "Failed to connect to site", http.StatusBadGateway)
-		return
-	}
-
-	// Ensure stream is closed on exit
-	defer backend.CloseStream(streamID)
-
-	// 2. Clean hop-by-hop headers
-	cleanRequestHeaders(r)
-
-	// 3. Serialize the HTTP request
-	var reqBuf bytes.Buffer
-	if err := r.Write(&reqBuf); err != nil {
-		elapsed := time.Since(start)
-		fmt.Printf("[%s] %s %s - 500 (%.1fs) %v\n", time.Now().Format("15:04:05"), r.Method, reqPath, elapsed.Seconds(), err)
-		http.Error(w, "Failed to serialize request", http.StatusInternalServerError)
-		return
-	}
-
-	// 4. Send via backend
-	if err := backend.SendData(ctx, streamID, reqBuf.Bytes()); err != nil {
-		elapsed := time.Since(start)
-		fmt.Printf("[%s] %s %s - 502 (%.1fs) %v\n", time.Now().Format("15:04:05"), r.Method, reqPath, elapsed.Seconds(), err)
-		http.Error(w, "Failed to send request", http.StatusBadGateway)
-		return
-	}
-
-	// 5. Receive response
-	respData, err := backend.RecvData(ctx, streamID)
-	if err != nil {
-		elapsed := time.Since(start)
-		fmt.Printf("[%s] %s %s - 502 (%.1fs) %v\n", time.Now().Format("15:04:05"), r.Method, reqPath, elapsed.Seconds(), err)
-		http.Error(w, "Failed to receive response", http.StatusBadGateway)
-		return
-	}
-
-	// 6. Parse HTTP response
-	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(respData)), r)
-	if err != nil {
-		elapsed := time.Since(start)
-		fmt.Printf("[%s] %s %s - 502 (%.1fs) %v\n", time.Now().Format("15:04:05"), r.Method, reqPath, elapsed.Seconds(), err)
-		http.Error(w, "Invalid response from site", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	// 7. Clean response headers and copy to client
-	cleanResponseHeaders(resp)
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
-
-	// 8. Write status code and body
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
-
-	// Log request
-	elapsed := time.Since(start)
-	fmt.Printf("[%s] %s %s - %d (%.1fs)\n",
-		time.Now().Format("15:04:05"),
-		r.Method,
-		reqPath,
-		resp.StatusCode,
-		elapsed.Seconds(),
-	)
-}
-
-// cleanRequestHeaders removes hop-by-hop headers from request
-func cleanRequestHeaders(r *http.Request) {
-	hopByHop := []string{
-		"Connection",
-		"Keep-Alive",
-		"Proxy-Authenticate",
-		"Proxy-Authorization",
-		"TE",
-		"Trailers",
-		"Transfer-Encoding",
-		"Upgrade",
-	}
-
-	for _, h := range hopByHop {
-		r.Header.Del(h)
-	}
-}
-
-// cleanResponseHeaders removes hop-by-hop headers from response
-func cleanResponseHeaders(r *http.Response) {
-	hopByHop := []string{
-		"Connection",
-		"Keep-Alive",
-		"Proxy-Authenticate",
-		"Proxy-Authorization",
-		"TE",
-		"Trailers",
-		"Transfer-Encoding",
-		"Upgrade",
-	}
-
-	for _, h := range hopByHop {
-		r.Header.Del(h)
-	}
-}
 
 // parseRelay parses a relay specification "address,pubkey_hex"
 func parseRelay(spec string) (client.RelayInfo, error) {
@@ -236,10 +83,16 @@ func buildCircuitWithRetry(ctx context.Context, gate *adnl.Gateway, dir *directo
 			continue
 		}
 
-		fmt.Printf("Building circuit (attempt %d/%d)...\n", attempt, maxRetries)
-		fmt.Printf("  Entry:  %s (%s)\n", dir.GetRelayName(relays[0].Address), relays[0].Address)
-		fmt.Printf("  Middle: %s (%s)\n", dir.GetRelayName(relays[1].Address), relays[1].Address)
-		fmt.Printf("  Exit:   %s (%s)\n", dir.GetRelayName(relays[2].Address), relays[2].Address)
+		slog.Info("building circuit",
+			"attempt", attempt,
+			"max_retries", maxRetries,
+			"entry", relays[0].Address,
+			"entry_name", dir.GetRelayName(relays[0].Address),
+			"middle", relays[1].Address,
+			"middle_name", dir.GetRelayName(relays[1].Address),
+			"exit", relays[2].Address,
+			"exit_name", dir.GetRelayName(relays[2].Address),
+		)
 
 		circuit, err := client.NewClientCircuit(ctx, gate, relays)
 		if err == nil {
@@ -247,56 +100,10 @@ func buildCircuitWithRetry(ctx context.Context, gate *adnl.Gateway, dir *directo
 		}
 
 		lastErr = err
-		fmt.Printf("  Failed: %v\n", err)
+		slog.Warn("circuit build failed", "attempt", attempt, "error", err)
 	}
 
 	return nil, fmt.Errorf("failed after %d attempts: %w", maxRetries, lastErr)
-}
-
-// startRotation runs the circuit rotation loop with randomized intervals
-func (h *ProxyHandler) startRotation(ctx context.Context) {
-	if h.rotateInterval <= 0 {
-		return
-	}
-
-	for {
-		// Add ±30% jitter to prevent timing attacks
-		jitter := time.Duration(rand.Int63n(int64(h.rotateInterval) * 6 / 10)) // 0 to 60%
-		delay := h.rotateInterval - (h.rotateInterval * 3 / 10) + jitter       // base - 30% + jitter
-
-		select {
-		case <-time.After(delay):
-			h.rotateCircuit(ctx)
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-// rotateCircuit builds a new circuit and swaps it (only for circuit mode)
-func (h *ProxyHandler) rotateCircuit(ctx context.Context) {
-	if h.directMode {
-		return // No rotation in direct mode
-	}
-
-	fmt.Println()
-	newCircuit, err := buildCircuitWithRetry(ctx, h.gate, h.dir, h.retries)
-	if err != nil {
-		fmt.Printf("Rotation failed: %v (keeping current circuit)\n", err)
-		return
-	}
-
-	h.backendMu.Lock()
-	oldBackend := h.backend
-	h.backend = newCircuit
-	h.backendMu.Unlock()
-
-	if oldBackend != nil {
-		oldBackend.Close()
-	}
-
-	fmt.Printf("Circuit ready [%s]\n", hex.EncodeToString(newCircuit.ID)[:8])
-	fmt.Println()
 }
 
 func run(cmd *cobra.Command, args []string) {
@@ -311,6 +118,58 @@ func run(cmd *cobra.Command, args []string) {
 	directoryURL, _ := cmd.Flags().GetString("directory")
 	retries, _ := cmd.Flags().GetInt("retries")
 	rotateStr, _ := cmd.Flags().GetString("rotate")
+	ethRPC, _ := cmd.Flags().GetString("eth-rpc")
+	solRPC, _ := cmd.Flags().GetString("sol-rpc")
+	debug, _ := cmd.Flags().GetBool("debug")
+
+	// Load YAML config file if provided; CLI flags override file values.
+	configFile, _ := cmd.Flags().GetString("config-file")
+	if configFile != "" {
+		cfg, err := config.Load(configFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if !cmd.Flags().Changed("listen") && cfg.Listen != "" {
+			listen = cfg.Listen
+		}
+		if !cmd.Flags().Changed("auto") && !cmd.Flags().Changed("direct") && cfg.Mode != "" {
+			switch cfg.Mode {
+			case "auto":
+				auto = true
+			case "direct":
+				directMode = true
+			}
+		}
+		if !cmd.Flags().Changed("config") && cfg.TONConfig != "" {
+			configPath = cfg.TONConfig
+		}
+		if !cmd.Flags().Changed("directory") && cfg.DirectoryURL != "" {
+			directoryURL = cfg.DirectoryURL
+		}
+		if !cmd.Flags().Changed("retries") && cfg.Retries > 0 {
+			retries = cfg.Retries
+		}
+		if !cmd.Flags().Changed("rotate") && cfg.Rotate != "" {
+			rotateStr = cfg.Rotate
+		}
+		if !cmd.Flags().Changed("debug") && cfg.Debug {
+			debug = true
+		}
+		if !cmd.Flags().Changed("eth-rpc") {
+			if v, ok := cfg.RPC[".eth"]; ok {
+				ethRPC = v
+			}
+		}
+		if !cmd.Flags().Changed("sol-rpc") {
+			if v, ok := cfg.RPC[".sol"]; ok {
+				solRPC = v
+			}
+		}
+	}
+
+	// Initialize structured logger.
+	logger.Init(debug)
 
 	// Parse rotation interval
 	var rotateInterval time.Duration
@@ -318,43 +177,106 @@ func run(cmd *cobra.Command, args []string) {
 		var err error
 		rotateInterval, err = time.ParseDuration(rotateStr)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: invalid --rotate value: %s\n", rotateStr)
+			slog.Error("invalid --rotate value", "value", rotateStr)
 			os.Exit(1)
 		}
 	}
 
 	// Validate rotation requires auto mode (and not direct mode)
 	if rotateInterval > 0 && !auto {
-		fmt.Fprintln(os.Stderr, "Error: --rotate requires --auto mode")
+		slog.Error("--rotate requires --auto mode")
 		os.Exit(1)
 	}
 	if rotateInterval > 0 && directMode {
-		fmt.Fprintln(os.Stderr, "Error: --rotate is not supported in --direct mode")
+		slog.Error("--rotate is not supported in --direct mode")
 		os.Exit(1)
 	}
 
 	// Print banner
-	fmt.Println(banner)
+	fmt.Print(banner)
 	fmt.Printf("  Version: %s\n\n", version)
 
-	ctx := context.Background()
+	// ctx is cancelled on SIGINT or SIGTERM, which triggers graceful shutdown.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	var backend client.ProxyClient
 	var gate *adnl.Gateway
 	var dir *directory.Directory
 
+	// Initialize all registered chain resolvers.
+	// Start with any RPC overrides from the config file, then let CLI flags win.
+	rpcOverrides := make(map[string]string)
+	if configFile != "" {
+		fileCfg, _ := config.Load(configFile)
+		if fileCfg != nil {
+			for k, v := range fileCfg.RPC {
+				rpcOverrides[k] = v
+			}
+		}
+	}
+
+	polygonRPC, _ := cmd.Flags().GetString("polygon-rpc")
+	bnbRPC, _ := cmd.Flags().GetString("bnb-rpc")
+	btcRPC, _ := cmd.Flags().GetString("btc-rpc")
+
+	if ethRPC != "" {
+		rpcOverrides[".eth"] = ethRPC
+	}
+	if solRPC != "" {
+		rpcOverrides[".sol"] = solRPC
+	}
+	if polygonRPC != "" {
+		// Apply to all UD TLDs
+		for _, tld := range []string{".crypto", ".x", ".wallet", ".nft", ".dao", ".blockchain", ".bitcoin", ".zil"} {
+			rpcOverrides[tld] = polygonRPC
+		}
+	}
+	if bnbRPC != "" {
+		rpcOverrides[".bnb"] = bnbRPC
+	}
+	if btcRPC != "" {
+		rpcOverrides[".btc"] = btcRPC
+	}
+
+	disabled := make(map[string]bool)
+	// Apply disabled TLDs from config file first.
+	if configFile != "" {
+		fileCfg, _ := config.Load(configFile)
+		if fileCfg != nil {
+			for _, tld := range fileCfg.Disabled {
+				disabled[tld] = true
+			}
+		}
+	}
+	for _, cfg := range resolver.AllChains() {
+		flag := "no-" + strings.TrimPrefix(cfg.TLD, ".")
+		if val, _ := cmd.Flags().GetBool(flag); val {
+			disabled[cfg.TLD] = true
+		}
+	}
+
+	slog.Info("initializing chain resolvers")
+	multiRes, warnings := resolver.InitAll(rpcOverrides, disabled)
+	for _, w := range warnings {
+		slog.Warn("resolver init", "warning", w)
+	}
+	for _, tld := range multiRes.EnabledTLDs() {
+		slog.Info("resolver enabled", "tld", tld)
+	}
+
 	if directMode {
 		// Direct mode: connect directly to TON sites (no anonymity)
-		fmt.Print("Connecting to TON network... ")
+		slog.Info("connecting to TON network")
 
-		directClient, err := direct.NewDirectClient(ctx, configPath)
+		directClient, err := direct.NewDirectClient(ctx, configPath, multiRes)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "\nError: failed to create direct client: %v\n", err)
+			slog.Error("failed to create direct client", "error", err)
 			os.Exit(1)
 		}
 
 		backend = directClient
-		fmt.Println("OK")
-		fmt.Println("Mode: Direct (no anonymity, faster)")
+		slog.Info("mode: direct (no anonymity, faster)")
 	} else {
 		// Circuit mode: 3-hop garlic routing (anonymous)
 
@@ -364,7 +286,7 @@ func run(cmd *cobra.Command, args []string) {
 		// Create ADNL gateway
 		gate = adnl.NewGateway(privateKey)
 		if err := gate.StartClient(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to start ADNL gateway: %v\n", err)
+			slog.Error("failed to start ADNL gateway", "error", err)
 			os.Exit(1)
 		}
 
@@ -372,100 +294,129 @@ func run(cmd *cobra.Command, args []string) {
 
 		if auto {
 			// Auto mode: fetch directory and build circuit with retry
-			fmt.Print("Loading community relays... ")
+			slog.Info("loading community relays")
 
 			var err error
 			dir, err = directory.Fetch(directoryURL)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "\nError: failed to fetch directory: %v\n", err)
+				slog.Error("failed to fetch directory", "error", err)
 				os.Exit(1)
 			}
 
-			fmt.Printf("%d found\n", len(dir.Relays))
+			slog.Info("relays found", "count", len(dir.Relays))
 
 			circuit, err = buildCircuitWithRetry(ctx, gate, dir, retries)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				slog.Error("circuit build failed", "error", err)
 				os.Exit(1)
 			}
 		} else {
 			// Manual mode: use provided relay flags
 			if relay1 == "" || relay2 == "" || relay3 == "" {
-				fmt.Fprintln(os.Stderr, "Error: use --auto, --direct, or provide --relay1, --relay2, --relay3")
+				slog.Error("use --auto, --direct, or provide --relay1, --relay2, --relay3")
 				os.Exit(1)
 			}
 
 			r1, err := parseRelay(relay1)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: invalid relay1: %v\n", err)
+				slog.Error("invalid relay1", "error", err)
 				os.Exit(1)
 			}
 
 			r2, err := parseRelay(relay2)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: invalid relay2: %v\n", err)
+				slog.Error("invalid relay2", "error", err)
 				os.Exit(1)
 			}
 
 			r3, err := parseRelay(relay3)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: invalid relay3: %v\n", err)
+				slog.Error("invalid relay3", "error", err)
 				os.Exit(1)
 			}
 
 			relays := []client.RelayInfo{r1, r2, r3}
 
-			fmt.Println("Building circuit...")
-			fmt.Printf("  Entry:  %s\n", r1.Address)
-			fmt.Printf("  Middle: %s\n", r2.Address)
-			fmt.Printf("  Exit:   %s\n", r3.Address)
+			slog.Info("building circuit", "entry", r1.Address, "middle", r2.Address, "exit", r3.Address)
 
 			circuit, err = client.NewClientCircuit(ctx, gate, relays)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: failed to create circuit: %v\n", err)
+				slog.Error("failed to create circuit", "error", err)
 				os.Exit(1)
 			}
 		}
 
 		backend = circuit
-		fmt.Printf("Circuit ready [%s]\n", hex.EncodeToString(circuit.ID)[:8])
-		fmt.Println("Mode: Anonymous (3-hop garlic circuit)")
+		slog.Info("circuit ready", "id", hex.EncodeToString(circuit.ID)[:8])
+		slog.Info("mode: anonymous (3-hop garlic circuit)")
 	}
-
-	fmt.Println()
 
 	// Show rotation status
 	if rotateInterval > 0 {
-		fmt.Printf("Circuit rotation: every %s\n", rotateInterval)
+		slog.Info("circuit rotation enabled", "interval", rotateInterval)
 	}
 
-	fmt.Printf("Proxy listening on http://%s\n", listen)
-	fmt.Println()
+	slog.Info("proxy listening", "addr", listen)
 
 	// Create proxy handler
-	handler := &ProxyHandler{
-		backend:        backend,
-		gate:           gate,
-		dir:            dir,
-		rotateInterval: rotateInterval,
-		retries:        retries,
-		directMode:     directMode,
-	}
+	handler := proxy.NewProxyHandler(proxy.HandlerConfig{
+		Backend:        backend,
+		Gate:           gate,
+		Dir:            dir,
+		RotateInterval: rotateInterval,
+		Retries:        retries,
+		DirectMode:     directMode,
+		MultiResolver:  multiRes,
+		BuildCircuit:   buildCircuitWithRetry,
+	})
 
 	// Start rotation goroutine if enabled
 	if rotateInterval > 0 && !directMode {
-		go handler.startRotation(ctx)
+		go handler.StartRotation(ctx)
 	}
 
 	// Start HTTP proxy server
 	server := &http.Server{
-		Addr:    listen,
-		Handler: handler,
+		Addr:              listen,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		fmt.Fprintf(os.Stderr, "Error: HTTP server error: %v\n", err)
-		os.Exit(1)
+	// Run server in background so we can handle shutdown signals.
+	serverErr := make(chan error, 1)
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			serverErr <- err
+		}
+		close(serverErr)
+	}()
+
+	// shutdown closes all backend resources in a deterministic order.
+	shutdown := func() {
+		if b := handler.Backend(); b != nil {
+			b.Close()
+		}
+		multiRes.Close()
+		resolver.CloseSharedUDClient()
+	}
+
+	// Block until a signal is received or the server exits with an error.
+	select {
+	case err := <-serverErr:
+		if err != nil {
+			slog.Error("HTTP server error", "error", err)
+			shutdown()
+			os.Exit(1)
+		}
+	case <-ctx.Done():
+		slog.Info("shutting down")
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			slog.Error("graceful shutdown failed", "error", err)
+		}
+		shutdown()
 	}
 }
 
@@ -507,6 +458,8 @@ Then configure your browser to use http://localhost:8080 as HTTP proxy.`,
 	}
 	rootCmd.AddCommand(versionCmd)
 
+	rootCmd.Flags().Bool("debug", false, "Enable debug logging")
+	rootCmd.Flags().String("config-file", "", "YAML config file (CLI flags override)")
 	rootCmd.Flags().String("relay1", "", "Entry relay (format: ip:port,pubkey_hex)")
 	rootCmd.Flags().String("relay2", "", "Middle relay (format: ip:port,pubkey_hex)")
 	rootCmd.Flags().String("relay3", "", "Exit relay (format: ip:port,pubkey_hex)")
@@ -518,6 +471,18 @@ Then configure your browser to use http://localhost:8080 as HTTP proxy.`,
 	rootCmd.Flags().Int("retries", 3, "Max circuit build attempts in auto mode")
 	rootCmd.Flags().String("rotate", "", "Circuit rotation interval (default 10m)")
 	rootCmd.Flags().Lookup("rotate").NoOptDefVal = "10m"
+
+	// Multi-chain resolver flags
+	rootCmd.Flags().String("eth-rpc", "", "Ethereum RPC (default: public)")
+	rootCmd.Flags().String("sol-rpc", "", "Solana RPC (default: public)")
+	rootCmd.Flags().String("polygon-rpc", "", "Polygon RPC for Unstoppable Domains (default: public)")
+	rootCmd.Flags().String("bnb-rpc", "", "BNB Chain RPC for Space ID (default: public)")
+	rootCmd.Flags().String("btc-rpc", "", "Stacks API for BNS (default: api.mainnet.hiro.so)")
+	// Auto-generated disable flags for all registered chains
+	for _, cfg := range resolver.AllChains() {
+		tld := strings.TrimPrefix(cfg.TLD, ".")
+		rootCmd.Flags().Bool("no-"+tld, false, fmt.Sprintf("Disable %s domain resolution", cfg.TLD))
+	}
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)

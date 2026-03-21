@@ -132,9 +132,17 @@ func (rb *RouteBuilder) AddDummyHops(route *Route) *Route {
 		dummyKey := make([]byte, 32)
 		rand.Read(dummyKey)
 
-		// Insert at random position (but not at the end - destination must be last)
-		pos := randInt(len(newHops))
-		if pos == len(newHops) {
+		// Insert at random position in [1, len-1] so that:
+		//   - position 0 (the entry hop) is never displaced by a dummy, and
+		//   - the destination (last hop) always remains last.
+		// Requires at least 2 real hops to have a valid insertion range.
+		var pos int
+		if len(newHops) < 2 {
+			// Not enough hops to safely insert a dummy; skip.
+			continue
+		}
+		pos = 1 + randInt(len(newHops)-1)
+		if pos >= len(newHops) {
 			pos = len(newHops) - 1
 		}
 

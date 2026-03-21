@@ -108,7 +108,12 @@ func (m *TunnelMidpoint) ReceivePacket(data []byte, srcAddr net.Addr) error {
 	// Try to parse as tunnel packet contents
 	var contents TunnelPacketContents
 	if err := contents.Parse(decrypted); err == nil {
-		// Successfully parsed, forward the message
+		// Successfully parsed — only forward if there is an actual message payload.
+		// If FlagHasMessage is not set, contents.Message is nil; forwarding nil
+		// would send an empty/invalid packet to the next hop, so we drop it.
+		if contents.Flags&FlagHasMessage == 0 || contents.Message == nil {
+			return nil
+		}
 		return m.forward(contents.Message, srcAddr)
 	}
 

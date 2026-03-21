@@ -14,7 +14,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/TONresistor/tonnet-proxy/internal/client"
+	"github.com/adnl-network/adnl-proxy/internal/client"
+	"github.com/adnl-network/adnl-proxy/internal/resolver"
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/adnl/dht"
 	rldphttp "github.com/xssnick/tonutils-go/adnl/rldp/http"
@@ -25,6 +26,9 @@ import (
 
 const (
 	defaultConfigURL = "https://ton.org/global.config.json"
+
+	// maxResponseBodySize is the maximum response body size (100 MB).
+	maxResponseBodySize = 100 * 1024 * 1024
 )
 
 // DirectClient connects directly to TON sites without garlic routing
@@ -35,9 +39,16 @@ type DirectClient struct {
 	liteClient ton.APIClientWrapped
 	transport  *rldphttp.Transport
 	privateKey ed25519.PrivateKey
+	httpClient *http.Client
+
+	// Multi-chain resolver for .eth, .sol, etc.
+	multiResolver *resolver.MultiResolver
 
 	streams    sync.Map // streamID -> *stream
 	nextStream uint32
+
+	// requestWg tracks processRequest goroutines for graceful shutdown.
+	requestWg sync.WaitGroup
 }
 
 // stream represents an active connection to a TON site
@@ -54,8 +65,9 @@ type stream struct {
 // Ensure DirectClient implements ProxyClient interface
 var _ client.ProxyClient = (*DirectClient)(nil)
 
-// NewDirectClient creates a new direct client
-func NewDirectClient(ctx context.Context, configPath string) (*DirectClient, error) {
+// NewDirectClient creates a new direct client.
+// If multiRes is non-nil, it enables multi-chain domain resolution (.eth, .sol, etc.).
+func NewDirectClient(ctx context.Context, configPath string, multiRes *resolver.MultiResolver) (*DirectClient, error) {
 	// Use default config URL if not provided
 	if configPath == "" {
 		configPath = defaultConfigURL
@@ -105,18 +117,33 @@ func NewDirectClient(ctx context.Context, configPath string) (*DirectClient, err
 	transport := rldphttp.NewTransport(dhtClient, dnsClient, privateKey)
 
 	return &DirectClient{
-		gate:       gate,
-		dht:        dhtClient,
-		dnsClient:  dnsClient,
-		liteClient: api,
-		transport:  transport,
-		privateKey: privateKey,
+		gate:          gate,
+		dht:           dhtClient,
+		dnsClient:     dnsClient,
+		liteClient:    api,
+		transport:     transport,
+		privateKey:    privateKey,
+		multiResolver: multiRes,
+		httpClient: &http.Client{
+			Transport: transport,
+			Timeout:   60 * time.Second,
+		},
 	}, nil
+}
+
+// nextStreamID atomically increments the stream counter and skips 0 on uint32 wraparound.
+func (c *DirectClient) nextStreamID() int {
+	for {
+		id := atomic.AddUint32(&c.nextStream, 1)
+		if id != 0 {
+			return int(id)
+		}
+	}
 }
 
 // OpenStream opens a connection to the specified host:port
 func (c *DirectClient) OpenStream(ctx context.Context, host string, port int) (int, error) {
-	streamID := int(atomic.AddUint32(&c.nextStream, 1))
+	streamID := c.nextStreamID()
 
 	s := &stream{
 		host:     host,
@@ -141,13 +168,23 @@ func (c *DirectClient) SendData(ctx context.Context, streamID int, data []byte) 
 	s.mu.Unlock()
 
 	// Process the HTTP request asynchronously
-	go c.processRequest(ctx, s)
+	c.requestWg.Add(1)
+	go func() {
+		defer c.requestWg.Done()
+		c.processRequest(ctx, s)
+	}()
 
 	return nil
 }
 
 // processRequest handles the actual HTTP request to the TON site
 func (c *DirectClient) processRequest(ctx context.Context, s *stream) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.sendError(fmt.Sprintf("internal error: %v", r))
+		}
+	}()
+
 	// Parse the HTTP request
 	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(s.request)))
 	if err != nil {
@@ -155,17 +192,27 @@ func (c *DirectClient) processRequest(ctx context.Context, s *stream) {
 		return
 	}
 
-	// Validate domain
+	// Resolve domain to determine the target host for RLDP transport.
+	// For .ton/.adnl/.t.me: pass through directly (TON DNS resolves internally).
+	// For .eth/.sol/etc.: resolve via multi-chain resolver to get ADNL address,
+	// then rewrite host to <hex>.adnl so the RLDP transport connects directly.
 	host := s.host
-	if !strings.HasSuffix(host, ".ton") && !strings.HasSuffix(host, ".adnl") && !strings.HasSuffix(host, ".t.me") {
-		s.sendError(fmt.Sprintf("unsupported domain: %s", host))
-		return
-	}
+	isTONNative := strings.HasSuffix(host, ".ton") || strings.HasSuffix(host, ".adnl") || strings.HasSuffix(host, ".t.me")
 
-	// Create HTTP client with RLDP transport
-	httpClient := &http.Client{
-		Transport: c.transport,
-		Timeout:   60 * time.Second,
+	if !isTONNative {
+		// Try multi-chain resolver
+		if c.multiResolver == nil || !c.multiResolver.Supports(host) {
+			s.sendError(fmt.Sprintf("unsupported domain: %s", host))
+			return
+		}
+
+		newHost, err := c.multiResolver.ResolveToADNL(host)
+		if err != nil {
+			s.sendError(fmt.Sprintf("resolve %s: %v", host, err))
+			return
+		}
+		fmt.Printf("  [resolver] %s -> %s\n", s.host, newHost)
+		host = newHost
 	}
 
 	// Build the full URL
@@ -187,7 +234,7 @@ func (c *DirectClient) processRequest(ctx context.Context, s *stream) {
 	newReq.Host = host
 
 	// Execute request via RLDP
-	resp, err := httpClient.Do(newReq)
+	resp, err := c.httpClient.Do(newReq)
 	if err != nil {
 		s.sendError(fmt.Sprintf("request failed: %v", err))
 		return
@@ -195,8 +242,9 @@ func (c *DirectClient) processRequest(ctx context.Context, s *stream) {
 	defer resp.Body.Close()
 
 	// Read full body to fix Content-Length mismatch from tonutils-go bug
-	// (tonutils copies request Content-Length to response Content-Length)
-	body, err := io.ReadAll(resp.Body)
+	// (tonutils copies request Content-Length to response Content-Length).
+	// Limit to maxResponseBodySize to prevent OOM from malicious responses.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodySize))
 	if err != nil {
 		s.sendError(fmt.Sprintf("read response body: %v", err))
 		return
@@ -241,7 +289,10 @@ func (s *stream) sendError(msg string) {
 	resp.Header.Set("Content-Type", "text/plain")
 
 	var buf bytes.Buffer
-	resp.Write(&buf)
+	if err := resp.Write(&buf); err != nil {
+		// Best-effort: if serialization fails, send what we have.
+		buf.WriteString(msg)
+	}
 
 	s.mu.Lock()
 	s.response = buf.Bytes()
@@ -261,10 +312,13 @@ func (c *DirectClient) RecvData(ctx context.Context, streamID int) ([]byte, erro
 	}
 	s := si.(*stream)
 
+	timer := time.NewTimer(60 * time.Second)
+	defer timer.Stop()
+
 	select {
 	case data := <-s.respChan:
 		return data, nil
-	case <-time.After(60 * time.Second):
+	case <-timer.C:
 		return nil, fmt.Errorf("timeout waiting for response")
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -273,13 +327,23 @@ func (c *DirectClient) RecvData(ctx context.Context, streamID int) ([]byte, erro
 
 // CloseStream closes a specific stream
 func (c *DirectClient) CloseStream(streamID int) {
-	c.streams.Delete(streamID)
+	if si, ok := c.streams.LoadAndDelete(streamID); ok {
+		s := si.(*stream)
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
+	}
 }
 
-// Close closes the client
+// Close closes the client, waiting for in-flight requests to complete.
 func (c *DirectClient) Close() error {
+	c.requestWg.Wait()
 	if c.dht != nil {
 		c.dht.Close()
 	}
+	if c.gate != nil {
+		c.gate.Close()
+	}
 	return nil
 }
+
