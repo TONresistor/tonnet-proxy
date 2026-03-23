@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -53,7 +54,7 @@ func newBNSResolver(rpcURL string) (*BNSResolver, error) {
 }
 
 // adnlTXTRegex matches _adnl TXT records in zone files
-var adnlTXTRegex = regexp.MustCompile(`(?i)_adnl[\s.]+(?:\S+\s+)?IN\s+TXT\s+"([^"]+)"`)
+var adnlTXTRegex = regexp.MustCompile(`(?mi)^_adnl[\s.]+(?:\S+\s+)?IN\s+TXT\s+"([^"]+)"`)
 
 func (r *BNSResolver) Resolve(domain string) (string, error) {
 	// Strip .btc suffix
@@ -63,7 +64,7 @@ func (r *BNSResolver) Resolve(domain string) (string, error) {
 	}
 
 	// Step 1: Check that the name exists
-	nameURL := fmt.Sprintf("%s/v1/names/%s.btc", r.apiURL, name)
+	nameURL := fmt.Sprintf("%s/v1/names/%s.btc", r.apiURL, url.PathEscape(name))
 	resp, err := r.httpClient.Get(nameURL)
 	if err != nil {
 		return "", fmt.Errorf("fetch name info for %q: %w", domain, err)
@@ -90,7 +91,7 @@ func (r *BNSResolver) Resolve(domain string) (string, error) {
 	}
 
 	// Step 2: Fetch the zone file
-	zoneURL := fmt.Sprintf("%s/v1/names/%s.btc/zonefile", r.apiURL, name)
+	zoneURL := fmt.Sprintf("%s/v1/names/%s.btc/zonefile", r.apiURL, url.PathEscape(name))
 	resp2, err := r.httpClient.Get(zoneURL)
 	if err != nil {
 		return "", fmt.Errorf("fetch zone file for %q: %w", domain, err)

@@ -171,7 +171,10 @@ func (c *ClientCircuit) createCircuit(ctx context.Context, relay RelayInfo) ([]b
 	}
 
 	// Compute shared key
-	sharedKey := computeSharedKey(clientPriv, resp.RelayKey)
+	sharedKey, err := computeSharedKey(clientPriv, resp.RelayKey)
+	if err != nil {
+		return nil, fmt.Errorf("compute shared key: %w", err)
+	}
 
 	return sharedKey, nil
 }
@@ -208,7 +211,10 @@ func (c *ClientCircuit) extendCircuit(ctx context.Context, relay RelayInfo) ([]b
 	}
 
 	// Compute shared key with middle relay
-	sharedKey := computeSharedKey(clientPriv, resp.RelayKey)
+	sharedKey, err := computeSharedKey(clientPriv, resp.RelayKey)
+	if err != nil {
+		return nil, fmt.Errorf("compute shared key: %w", err)
+	}
 
 	return sharedKey, nil
 }
@@ -275,7 +281,10 @@ func (c *ClientCircuit) extendCircuitViaRelay(ctx context.Context, relay RelayIn
 	}
 
 	// Compute shared key with exit relay
-	sharedKey := computeSharedKey(clientPriv, extendedResp.RelayKey)
+	sharedKey, err := computeSharedKey(clientPriv, extendedResp.RelayKey)
+	if err != nil {
+		return nil, fmt.Errorf("compute shared key: %w", err)
+	}
 
 	return sharedKey, nil
 }
@@ -626,33 +635,33 @@ func generateX25519Keypair() ([]byte, []byte) {
 // computeSharedKey computes the shared secret from X25519 key exchange.
 // Finding #42: Uses crypto/ecdh instead of deprecated curve25519.ScalarMult.
 // Finding #43: Validates that the shared secret is not all zeros (low-order point check).
-func computeSharedKey(privKeyBytes, peerPubKeyBytes []byte) []byte {
+func computeSharedKey(privKeyBytes, peerPubKeyBytes []byte) ([]byte, error) {
 	curve := ecdh.X25519()
 
 	privKey, err := curve.NewPrivateKey(privKeyBytes)
 	if err != nil {
-		panic(fmt.Sprintf("computeSharedKey: invalid private key: %v", err))
+		return nil, fmt.Errorf("computeSharedKey: invalid private key: %w", err)
 	}
 
 	peerPub, err := curve.NewPublicKey(peerPubKeyBytes)
 	if err != nil {
-		panic(fmt.Sprintf("computeSharedKey: invalid peer public key: %v", err))
+		return nil, fmt.Errorf("computeSharedKey: invalid peer public key: %w", err)
 	}
 
 	shared, err := privKey.ECDH(peerPub)
 	if err != nil {
-		panic(fmt.Sprintf("computeSharedKey: ECDH failed: %v", err))
+		return nil, fmt.Errorf("computeSharedKey: ECDH failed: %w", err)
 	}
 
 	// Finding #43: Reject low-order points that produce an all-zeros shared secret.
 	if bytes.Equal(shared, make([]byte, len(shared))) {
-		panic("computeSharedKey: shared secret is all zeros (low-order point)")
+		return nil, fmt.Errorf("computeSharedKey: shared secret is all zeros (low-order point)")
 	}
 
 	// Derive symmetric key from shared secret using SHA256
 	h := sha256.New()
 	h.Write(shared)
-	return h.Sum(nil)
+	return h.Sum(nil), nil
 }
 
 // encryptPayload encrypts data with ChaCha20-Poly1305 (nonce prepended)

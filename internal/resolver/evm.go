@@ -13,9 +13,18 @@ const (
 	evmDialTimeout = 5 * time.Second
 )
 
+// evmChainIDs maps TLD suffixes to their expected EVM chain IDs.
+var evmChainIDs = map[string]int64{
+	".eth": 1,
+	".bnb": 56,
+	".crypto": 137, ".x": 137, ".wallet": 137, ".nft": 137,
+	".dao": 137, ".blockchain": 137, ".bitcoin": 137, ".zil": 137,
+}
+
 // dialAndVerifyEVM dials an EVM-compatible JSON-RPC endpoint and verifies
-// connectivity by requesting the chain ID.
-func dialAndVerifyEVM(rpcURL string) (*ethclient.Client, error) {
+// connectivity by requesting the chain ID. If expectedChainID is provided,
+// the actual chain ID must match.
+func dialAndVerifyEVM(rpcURL string, expectedChainID ...int64) (*ethclient.Client, error) {
 	client, err := ethclient.Dial(rpcURL)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", rpcURL, err)
@@ -24,9 +33,15 @@ func dialAndVerifyEVM(rpcURL string) (*ethclient.Client, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), evmDialTimeout)
 	defer cancel()
 
-	if _, err = client.ChainID(ctx); err != nil {
+	chainID, err := client.ChainID(ctx)
+	if err != nil {
 		client.Close()
 		return nil, fmt.Errorf("RPC check failed for %s: %w", rpcURL, err)
+	}
+
+	if len(expectedChainID) > 0 && chainID.Int64() != expectedChainID[0] {
+		client.Close()
+		return nil, fmt.Errorf("chain ID mismatch for %s: expected %d, got %d", rpcURL, expectedChainID[0], chainID.Int64())
 	}
 
 	return client, nil
@@ -35,8 +50,9 @@ func dialAndVerifyEVM(rpcURL string) (*ethclient.Client, error) {
 // dialEVMWithFallback connects to rpcURL if non-empty, otherwise iterates
 // through the default RPCs registered for tld until one succeeds.
 func dialEVMWithFallback(rpcURL string, tld string) (*ethclient.Client, error) {
+	expected := evmChainIDs[tld]
 	if rpcURL != "" {
-		return dialAndVerifyEVM(rpcURL)
+		return dialAndVerifyEVM(rpcURL, expected)
 	}
 
 	cfg := findChainConfig(tld)
@@ -46,7 +62,7 @@ func dialEVMWithFallback(rpcURL string, tld string) (*ethclient.Client, error) {
 
 	var lastErr error
 	for _, url := range cfg.DefaultRPCs {
-		c, err := dialAndVerifyEVM(url)
+		c, err := dialAndVerifyEVM(url, expected)
 		if err == nil {
 			return c, nil
 		}

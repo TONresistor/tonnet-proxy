@@ -73,9 +73,11 @@ func RegisterChain(cfg ChainConfig) {
 	registry = append(registry, cfg)
 }
 
-// AllChains returns all registered chain configs.
+// AllChains returns a copy of all registered chain configs.
 func AllChains() []ChainConfig {
-	return registry
+	result := make([]ChainConfig, len(registry))
+	copy(result, registry)
+	return result
 }
 
 // cacheEntry holds a cached ADNL resolution result.
@@ -84,16 +86,77 @@ type cacheEntry struct {
 	expiresAt time.Time
 }
 
+// maxCacheEntries is the maximum number of entries in the resolution cache.
+const maxCacheEntries = 10000
+
 // MultiResolver routes resolution to chain-specific resolvers based on TLD.
 type MultiResolver struct {
 	resolvers map[string]Resolver
-	cache     sync.Map // domain -> cacheEntry
+	cacheMu   sync.RWMutex
+	cacheMap  map[string]cacheEntry
+	done      chan struct{}
 }
 
 // NewMultiResolver creates a new multi-chain resolver.
 func NewMultiResolver() *MultiResolver {
-	return &MultiResolver{
+	m := &MultiResolver{
 		resolvers: make(map[string]Resolver),
+		cacheMap:  make(map[string]cacheEntry),
+		done:      make(chan struct{}),
+	}
+	go m.cleanupLoop()
+	return m
+}
+
+// cleanupLoop runs in the background and evicts expired cache entries every minute.
+func (m *MultiResolver) cleanupLoop() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			now := time.Now()
+			m.cacheMu.Lock()
+			for k, v := range m.cacheMap {
+				if now.After(v.expiresAt) {
+					delete(m.cacheMap, k)
+				}
+			}
+			m.cacheMu.Unlock()
+		case <-m.done:
+			return
+		}
+	}
+}
+
+// evictIfNeeded evicts entries when the cache is at capacity.
+// First removes all expired entries; if still full, removes the entry with the earliest expiresAt.
+func (m *MultiResolver) evictIfNeeded() {
+	if len(m.cacheMap) <= maxCacheEntries {
+		return
+	}
+	now := time.Now()
+	for k, v := range m.cacheMap {
+		if now.After(v.expiresAt) {
+			delete(m.cacheMap, k)
+		}
+	}
+	if len(m.cacheMap) <= maxCacheEntries {
+		return
+	}
+	// Find and delete the entry with the earliest expiresAt.
+	var oldestKey string
+	var oldestTime time.Time
+	first := true
+	for k, v := range m.cacheMap {
+		if first || v.expiresAt.Before(oldestTime) {
+			oldestKey = k
+			oldestTime = v.expiresAt
+			first = false
+		}
+	}
+	if oldestKey != "" {
+		delete(m.cacheMap, oldestKey)
 	}
 }
 
@@ -131,8 +194,9 @@ func (m *MultiResolver) EnabledTLDs() []string {
 	return tlds
 }
 
-// Close closes all registered resolvers.
+// Close closes all registered resolvers and stops the cache cleanup goroutine.
 func (m *MultiResolver) Close() {
+	close(m.done)
 	for _, r := range m.resolvers {
 		r.Close()
 	}
@@ -207,12 +271,16 @@ func SerializeADNLAddress(addr []byte) (string, error) {
 // SerializeADNLAddress → append ".adnl" → cache store.
 func (m *MultiResolver) ResolveToADNL(domain string) (string, error) {
 	// Check cache first.
-	if v, ok := m.cache.Load(domain); ok {
-		entry := v.(cacheEntry)
+	m.cacheMu.RLock()
+	entry, ok := m.cacheMap[domain]
+	m.cacheMu.RUnlock()
+	if ok {
 		if time.Now().Before(entry.expiresAt) {
 			return entry.adnlHost, nil
 		}
-		m.cache.Delete(domain)
+		m.cacheMu.Lock()
+		delete(m.cacheMap, domain)
+		m.cacheMu.Unlock()
 	}
 
 	rawHex, err := m.Resolve(domain)
@@ -235,10 +303,13 @@ func (m *MultiResolver) ResolveToADNL(domain string) (string, error) {
 	}
 
 	adnlHost := b32 + adnlDomainSuffix
-	m.cache.Store(domain, cacheEntry{
+	m.cacheMu.Lock()
+	m.evictIfNeeded()
+	m.cacheMap[domain] = cacheEntry{
 		adnlHost:  adnlHost,
 		expiresAt: time.Now().Add(resolveCacheTTL),
-	})
+	}
+	m.cacheMu.Unlock()
 
 	return adnlHost, nil
 }

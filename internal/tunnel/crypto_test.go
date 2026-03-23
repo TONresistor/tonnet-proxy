@@ -129,10 +129,10 @@ func TestBuildOnionPacket(t *testing.T) {
 	}
 	route := &Route{Hops: hops}
 
-	// Sender's key
-	senderPub, senderPriv, _ := ed25519.GenerateKey(rand.Reader)
-
 	payload := []byte("Multi-layer encrypted message through garlic routing!")
+
+	// Generate sender key (ephemeral per session)
+	senderPub, senderPriv, _ := ed25519.GenerateKey(rand.Reader)
 
 	// Build onion packet
 	packet, err := BuildOnionPacket(payload, route, senderPriv)
@@ -145,6 +145,7 @@ func TestBuildOnionPacket(t *testing.T) {
 	t.Logf("Overhead per layer: ~%d bytes", (len(packet)-len(payload))/numHops)
 
 	// Now decrypt layer by layer (simulating each hop)
+	// Packet format per layer: [keyHash(32)] + [checksum(32)] + [encrypted_data]
 	current := packet
 
 	for i := 0; i < numHops; i++ {
@@ -176,8 +177,8 @@ func TestBuildOnionPacket(t *testing.T) {
 
 func TestUnwrapLayer(t *testing.T) {
 	// Setup
-	senderPub, senderPriv, _ := ed25519.GenerateKey(rand.Reader)
 	hopPub, hopPriv, _ := ed25519.GenerateKey(rand.Reader)
+	senderPub, senderPriv, _ := ed25519.GenerateKey(rand.Reader)
 
 	keyring := NewKeyring()
 	keyring.AddKey(hopPriv)
@@ -208,9 +209,6 @@ func TestUnwrapLayer(t *testing.T) {
 }
 
 func TestUnwrapAllLayers(t *testing.T) {
-	// Setup sender
-	senderPub, senderPriv, _ := ed25519.GenerateKey(rand.Reader)
-
 	// Create keyring with 3 hop keys
 	keyring := NewKeyring()
 	hops := make([]Hop, 3)
@@ -223,6 +221,7 @@ func TestUnwrapAllLayers(t *testing.T) {
 
 	route := &Route{Hops: hops}
 	payload := []byte("Secret payload through 3 hops")
+	senderPub, senderPriv, _ := ed25519.GenerateKey(rand.Reader)
 
 	// Build packet
 	packet, err := BuildOnionPacket(payload, route, senderPriv)
@@ -266,8 +265,8 @@ func TestCreateLayeredKeys(t *testing.T) {
 }
 
 func TestDecryptAtHop(t *testing.T) {
-	senderPub, senderPriv, _ := ed25519.GenerateKey(rand.Reader)
 	hopPub, hopPriv, _ := ed25519.GenerateKey(rand.Reader)
+	senderPub, senderPriv, _ := ed25519.GenerateKey(rand.Reader)
 
 	payload := []byte("Message for single hop")
 
@@ -275,7 +274,7 @@ func TestDecryptAtHop(t *testing.T) {
 	route := NewRoute(NewHop(hopPub, nil))
 	packet, _ := BuildOnionPacket(payload, route, senderPriv)
 
-	// Decrypt at hop (skipping key hash check)
+	// Decrypt at hop
 	decrypted, err := DecryptAtHop(packet, hopPriv, senderPub)
 	if err != nil {
 		t.Fatalf("DecryptAtHop: %v", err)
@@ -321,14 +320,13 @@ func BenchmarkDecryptLayer(b *testing.B) {
 }
 
 func BenchmarkBuildOnionPacket3Hops(b *testing.B) {
-	_, senderPriv, _ := ed25519.GenerateKey(rand.Reader)
-
 	hops := make([]Hop, 3)
 	for i := 0; i < 3; i++ {
 		pub, _, _ := ed25519.GenerateKey(rand.Reader)
 		hops[i] = NewHop(pub, nil)
 	}
 	route := &Route{Hops: hops}
+	_, senderPriv, _ := ed25519.GenerateKey(rand.Reader)
 
 	payload := make([]byte, 256)
 	rand.Read(payload)
@@ -342,14 +340,13 @@ func BenchmarkBuildOnionPacket3Hops(b *testing.B) {
 }
 
 func BenchmarkBuildOnionPacket5Hops(b *testing.B) {
-	_, senderPriv, _ := ed25519.GenerateKey(rand.Reader)
-
 	hops := make([]Hop, 5)
 	for i := 0; i < 5; i++ {
 		pub, _, _ := ed25519.GenerateKey(rand.Reader)
 		hops[i] = NewHop(pub, nil)
 	}
 	route := &Route{Hops: hops}
+	_, senderPriv, _ := ed25519.GenerateKey(rand.Reader)
 
 	payload := make([]byte, 256)
 	rand.Read(payload)

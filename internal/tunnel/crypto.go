@@ -110,8 +110,8 @@ func BuildOnionPacket(payload []byte, route *Route, senderPrivKey ed25519.Privat
 	return result, nil
 }
 
-// UnwrapLayer removes one encryption layer from the packet
-// Returns the inner data and the key hash that was used
+// UnwrapLayer removes one encryption layer from the packet.
+// Returns the inner data and the key hash that was used.
 func UnwrapLayer(data []byte, keyring Keyring, senderPubKey ed25519.PublicKey) ([]byte, [32]byte, error) {
 	if len(data) < 64 { // 32 key hash + 32 checksum minimum
 		return nil, [32]byte{}, ErrPacketTooShort
@@ -127,7 +127,7 @@ func UnwrapLayer(data []byte, keyring Keyring, senderPubKey ed25519.PublicKey) (
 		return nil, keyHash, ErrKeyNotFound
 	}
 
-	// Decrypt this layer
+	// Decrypt this layer (data[32:] contains [checksum(32)] + [encrypted_data])
 	decrypted, err := DecryptLayer(data[32:], privKey, senderPubKey)
 	if err != nil {
 		return nil, keyHash, fmt.Errorf("decrypt layer: %w", err)
@@ -136,21 +136,18 @@ func UnwrapLayer(data []byte, keyring Keyring, senderPubKey ed25519.PublicKey) (
 	return decrypted, keyHash, nil
 }
 
-// UnwrapAllLayers decrypts all layers of an onion packet
-// Useful for the final recipient who has all the keys
+// UnwrapAllLayers decrypts all layers of an onion packet.
+// Useful for the final recipient who has all the keys.
 func UnwrapAllLayers(data []byte, keyring Keyring, senderPubKey ed25519.PublicKey) ([]byte, error) {
 	current := data
 
 	for {
 		if len(current) < 64 {
-			// No more layers, return what we have
 			return current, nil
 		}
 
-		// Try to unwrap a layer
 		decrypted, _, err := UnwrapLayer(current, keyring, senderPubKey)
 		if err != nil {
-			// If we can't find the key, we've reached the payload
 			if err == ErrKeyNotFound {
 				return current, nil
 			}
@@ -167,8 +164,8 @@ func EncryptForRoute(payload []byte, route *Route, senderPrivKey ed25519.Private
 	return BuildOnionPacket(payload, route, senderPrivKey)
 }
 
-// DecryptAtHop decrypts one layer at a specific hop
-// Returns the data to forward to the next hop
+// DecryptAtHop decrypts one layer at a specific hop.
+// Returns the data to forward to the next hop.
 func DecryptAtHop(data []byte, hopPrivKey ed25519.PrivateKey, senderPubKey ed25519.PublicKey) ([]byte, error) {
 	if len(data) < 32 {
 		return nil, ErrPacketTooShort

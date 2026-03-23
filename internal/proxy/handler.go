@@ -13,6 +13,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -64,10 +65,10 @@ type ProxyHandler struct {
 	backend   client.ProxyClient
 	backendMu sync.RWMutex
 
-	// inflightWg counts requests currently using the active backend.
-	// RotateCircuit waits on this before closing the old backend so that
-	// in-flight requests can complete without receiving a closed-circuit error.
-	inflightWg sync.WaitGroup
+	// backendWg counts requests currently using the active backend.
+	// RotateCircuit swaps it together with backend so that only the old
+	// WaitGroup is drained before closing the old backend.
+	backendWg *sync.WaitGroup
 
 	// Circuit-mode fields (unused in direct mode).
 	gate           *adnl.Gateway
@@ -103,6 +104,7 @@ type HandlerConfig struct {
 func NewProxyHandler(cfg HandlerConfig) *ProxyHandler {
 	return &ProxyHandler{
 		backend:        cfg.Backend,
+		backendWg:      &sync.WaitGroup{},
 		gate:           cfg.Gate,
 		dir:            cfg.Dir,
 		rotateInterval: cfg.RotateInterval,
@@ -128,6 +130,16 @@ func isTONNative(host string) bool {
 		}
 	}
 	return false
+}
+
+// logRequest prints a compact one-line request log to stderr.
+func logRequest(method, path string, status int, elapsed time.Duration, err error) {
+	ts := time.Now().Format("15:04:05")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[%s] %s %s - %d (%.1fs) %v\n", ts, method, path, status, elapsed.Seconds(), err)
+	} else {
+		fmt.Fprintf(os.Stderr, "[%s] %s %s - %d (%.1fs)\n", ts, method, path, status, elapsed.Seconds())
+	}
 }
 
 // ServeHTTP handles incoming HTTP requests by forwarding them through the
@@ -174,9 +186,10 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// waits for this request to finish before closing the old backend.
 	h.backendMu.RLock()
 	backend := h.backend
-	h.inflightWg.Add(1)
+	wg := h.backendWg
+	wg.Add(1)
 	h.backendMu.RUnlock()
-	defer h.inflightWg.Done()
+	defer wg.Done()
 
 	if backend == nil {
 		http.Error(w, "Proxy backend not ready", http.StatusServiceUnavailable)
@@ -195,8 +208,7 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 1. Open stream to the destination.
 	streamID, err := backend.OpenStream(ctx, r.Host, defaultBackendPort)
 	if err != nil {
-		elapsed := time.Since(start)
-		slog.Info("request", "method", r.Method, "host", r.Host, "path", reqPath, "status", 502, "duration", elapsed, "error", err)
+		logRequest(r.Method, reqPath, 502, time.Since(start), err)
 		http.Error(w, "Failed to connect to site", http.StatusBadGateway)
 		return
 	}
@@ -208,16 +220,14 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 3. Serialize the HTTP request.
 	var reqBuf bytes.Buffer
 	if err := r.Write(&reqBuf); err != nil {
-		elapsed := time.Since(start)
-		slog.Info("request", "method", r.Method, "host", r.Host, "path", reqPath, "status", 500, "duration", elapsed, "error", err)
+		logRequest(r.Method, reqPath, 500, time.Since(start), err)
 		http.Error(w, "Failed to serialize request", http.StatusInternalServerError)
 		return
 	}
 
 	// 4. Send via backend.
 	if err := backend.SendData(ctx, streamID, reqBuf.Bytes()); err != nil {
-		elapsed := time.Since(start)
-		slog.Info("request", "method", r.Method, "host", r.Host, "path", reqPath, "status", 502, "duration", elapsed, "error", err)
+		logRequest(r.Method, reqPath, 502, time.Since(start), err)
 		http.Error(w, "Failed to send request", http.StatusBadGateway)
 		return
 	}
@@ -225,8 +235,7 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 5. Receive response.
 	respData, err := backend.RecvData(ctx, streamID)
 	if err != nil {
-		elapsed := time.Since(start)
-		slog.Info("request", "method", r.Method, "host", r.Host, "path", reqPath, "status", 502, "duration", elapsed, "error", err)
+		logRequest(r.Method, reqPath, 502, time.Since(start), err)
 		http.Error(w, "Failed to receive response", http.StatusBadGateway)
 		return
 	}
@@ -234,8 +243,7 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 6. Parse HTTP response.
 	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(respData)), r)
 	if err != nil {
-		elapsed := time.Since(start)
-		slog.Info("request", "method", r.Method, "host", r.Host, "path", reqPath, "status", 502, "duration", elapsed, "error", err)
+		logRequest(r.Method, reqPath, 502, time.Since(start), err)
 		http.Error(w, "Invalid response from site", http.StatusBadGateway)
 		return
 	}
@@ -252,13 +260,10 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 8. Write status code and body.
 	w.WriteHeader(resp.StatusCode)
 	if _, err := io.Copy(w, resp.Body); err != nil {
-		// Client likely disconnected; log but don't overwrite the status code.
-		slog.Warn("request", "method", r.Method, "host", r.Host, "path", reqPath, "error", err)
 		return
 	}
 
-	elapsed := time.Since(start)
-	slog.Info("request", "method", r.Method, "host", r.Host, "path", reqPath, "status", resp.StatusCode, "duration", elapsed)
+	logRequest(r.Method, reqPath, resp.StatusCode, time.Since(start), nil)
 }
 
 // cleanRequestHeaders removes hop-by-hop headers from the request.
@@ -315,17 +320,16 @@ func (h *ProxyHandler) RotateCircuit(ctx context.Context) {
 
 	h.backendMu.Lock()
 	oldBackend := h.backend
+	oldWg := h.backendWg
 	h.backend = newCircuit
+	h.backendWg = &sync.WaitGroup{}
 	h.backendMu.Unlock()
 
 	if oldBackend != nil {
-		// Wait for all requests that snapshotted the old backend to finish
-		// before closing it, preventing 502 errors on in-flight requests.
-		// Timeout after 2 minutes to avoid leaking the goroutine and old backend.
 		go func() {
 			done := make(chan struct{})
 			go func() {
-				h.inflightWg.Wait()
+				oldWg.Wait()
 				close(done)
 			}()
 			select {

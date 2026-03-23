@@ -8,6 +8,7 @@ import (
 	cryptorand "crypto/rand"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -58,7 +59,7 @@ type stream struct {
 	request  []byte
 	response []byte
 	respChan chan []byte
-	closed   bool
+	cancel   context.CancelFunc
 	mu       sync.Mutex
 }
 
@@ -163,15 +164,17 @@ func (c *DirectClient) SendData(ctx context.Context, streamID int, data []byte) 
 	}
 	s := si.(*stream)
 
+	streamCtx, cancel := context.WithCancel(ctx)
 	s.mu.Lock()
 	s.request = data
+	s.cancel = cancel
 	s.mu.Unlock()
 
 	// Process the HTTP request asynchronously
 	c.requestWg.Add(1)
 	go func() {
 		defer c.requestWg.Done()
-		c.processRequest(ctx, s)
+		c.processRequest(streamCtx, s)
 	}()
 
 	return nil
@@ -211,7 +214,7 @@ func (c *DirectClient) processRequest(ctx context.Context, s *stream) {
 			s.sendError(fmt.Sprintf("resolve %s: %v", host, err))
 			return
 		}
-		fmt.Printf("  [resolver] %s -> %s\n", s.host, newHost)
+		slog.Debug("domain resolved", "from", s.host, "to", newHost)
 		host = newHost
 	}
 
@@ -330,7 +333,9 @@ func (c *DirectClient) CloseStream(streamID int) {
 	if si, ok := c.streams.LoadAndDelete(streamID); ok {
 		s := si.(*stream)
 		s.mu.Lock()
-		s.closed = true
+		if s.cancel != nil {
+			s.cancel()
+		}
 		s.mu.Unlock()
 	}
 }

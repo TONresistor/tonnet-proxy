@@ -6,10 +6,10 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -25,7 +25,7 @@ import (
 	"github.com/xssnick/tonutils-go/adnl"
 )
 
-var version = "v0.6.0"
+var version = "dev"
 
 const banner = `
     ┌─────────────────────────────────────────────────────────────────┐
@@ -83,16 +83,10 @@ func buildCircuitWithRetry(ctx context.Context, gate *adnl.Gateway, dir *directo
 			continue
 		}
 
-		slog.Info("building circuit",
-			"attempt", attempt,
-			"max_retries", maxRetries,
-			"entry", relays[0].Address,
-			"entry_name", dir.GetRelayName(relays[0].Address),
-			"middle", relays[1].Address,
-			"middle_name", dir.GetRelayName(relays[1].Address),
-			"exit", relays[2].Address,
-			"exit_name", dir.GetRelayName(relays[2].Address),
-		)
+		fmt.Fprintf(os.Stderr, "  Building circuit (attempt %d/%d)...\n", attempt, maxRetries)
+		fmt.Fprintf(os.Stderr, "    Entry:  %s (%s)\n", dir.GetRelayName(relays[0].Address), relays[0].Address)
+		fmt.Fprintf(os.Stderr, "    Middle: %s (%s)\n", dir.GetRelayName(relays[1].Address), relays[1].Address)
+		fmt.Fprintf(os.Stderr, "    Exit:   %s (%s)\n", dir.GetRelayName(relays[2].Address), relays[2].Address)
 
 		circuit, err := client.NewClientCircuit(ctx, gate, relays)
 		if err == nil {
@@ -100,7 +94,7 @@ func buildCircuitWithRetry(ctx context.Context, gate *adnl.Gateway, dir *directo
 		}
 
 		lastErr = err
-		slog.Warn("circuit build failed", "attempt", attempt, "error", err)
+		fmt.Fprintf(os.Stderr, "    Failed: %v\n", err)
 	}
 
 	return nil, fmt.Errorf("failed after %d attempts: %w", maxRetries, lastErr)
@@ -124,45 +118,49 @@ func run(cmd *cobra.Command, args []string) {
 
 	// Load YAML config file if provided; CLI flags override file values.
 	configFile, _ := cmd.Flags().GetString("config-file")
+	var fileCfg *config.ProxyConfig
 	if configFile != "" {
-		cfg, err := config.Load(configFile)
+		var err error
+		fileCfg, err = config.Load(configFile)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		if !cmd.Flags().Changed("listen") && cfg.Listen != "" {
-			listen = cfg.Listen
+	}
+	if fileCfg != nil {
+		if !cmd.Flags().Changed("listen") && fileCfg.Listen != "" {
+			listen = fileCfg.Listen
 		}
-		if !cmd.Flags().Changed("auto") && !cmd.Flags().Changed("direct") && cfg.Mode != "" {
-			switch cfg.Mode {
+		if !cmd.Flags().Changed("auto") && !cmd.Flags().Changed("direct") && fileCfg.Mode != "" {
+			switch fileCfg.Mode {
 			case "auto":
 				auto = true
 			case "direct":
 				directMode = true
 			}
 		}
-		if !cmd.Flags().Changed("config") && cfg.TONConfig != "" {
-			configPath = cfg.TONConfig
+		if !cmd.Flags().Changed("config") && fileCfg.TONConfig != "" {
+			configPath = fileCfg.TONConfig
 		}
-		if !cmd.Flags().Changed("directory") && cfg.DirectoryURL != "" {
-			directoryURL = cfg.DirectoryURL
+		if !cmd.Flags().Changed("directory") && fileCfg.DirectoryURL != "" {
+			directoryURL = fileCfg.DirectoryURL
 		}
-		if !cmd.Flags().Changed("retries") && cfg.Retries > 0 {
-			retries = cfg.Retries
+		if !cmd.Flags().Changed("retries") && fileCfg.Retries > 0 {
+			retries = fileCfg.Retries
 		}
-		if !cmd.Flags().Changed("rotate") && cfg.Rotate != "" {
-			rotateStr = cfg.Rotate
+		if !cmd.Flags().Changed("rotate") && fileCfg.Rotate != "" {
+			rotateStr = fileCfg.Rotate
 		}
-		if !cmd.Flags().Changed("debug") && cfg.Debug {
+		if !cmd.Flags().Changed("debug") && fileCfg.Debug {
 			debug = true
 		}
 		if !cmd.Flags().Changed("eth-rpc") {
-			if v, ok := cfg.RPC[".eth"]; ok {
+			if v, ok := fileCfg.RPC[".eth"]; ok {
 				ethRPC = v
 			}
 		}
 		if !cmd.Flags().Changed("sol-rpc") {
-			if v, ok := cfg.RPC[".sol"]; ok {
+			if v, ok := fileCfg.RPC[".sol"]; ok {
 				solRPC = v
 			}
 		}
@@ -177,18 +175,17 @@ func run(cmd *cobra.Command, args []string) {
 		var err error
 		rotateInterval, err = time.ParseDuration(rotateStr)
 		if err != nil {
-			slog.Error("invalid --rotate value", "value", rotateStr)
+			fmt.Fprintf(os.Stderr, "Error: invalid --rotate value: %s\n", rotateStr)
 			os.Exit(1)
 		}
 	}
 
-	// Validate rotation requires auto mode (and not direct mode)
 	if rotateInterval > 0 && !auto {
-		slog.Error("--rotate requires --auto mode")
+		fmt.Fprintf(os.Stderr, "Error: --rotate requires --auto mode\n")
 		os.Exit(1)
 	}
 	if rotateInterval > 0 && directMode {
-		slog.Error("--rotate is not supported in --direct mode")
+		fmt.Fprintf(os.Stderr, "Error: --rotate is not supported in --direct mode\n")
 		os.Exit(1)
 	}
 
@@ -207,12 +204,9 @@ func run(cmd *cobra.Command, args []string) {
 	// Initialize all registered chain resolvers.
 	// Start with any RPC overrides from the config file, then let CLI flags win.
 	rpcOverrides := make(map[string]string)
-	if configFile != "" {
-		fileCfg, _ := config.Load(configFile)
-		if fileCfg != nil {
-			for k, v := range fileCfg.RPC {
-				rpcOverrides[k] = v
-			}
+	if fileCfg != nil {
+		for k, v := range fileCfg.RPC {
+			rpcOverrides[k] = v
 		}
 	}
 
@@ -241,12 +235,9 @@ func run(cmd *cobra.Command, args []string) {
 
 	disabled := make(map[string]bool)
 	// Apply disabled TLDs from config file first.
-	if configFile != "" {
-		fileCfg, _ := config.Load(configFile)
-		if fileCfg != nil {
-			for _, tld := range fileCfg.Disabled {
-				disabled[tld] = true
-			}
+	if fileCfg != nil {
+		for _, tld := range fileCfg.Disabled {
+			disabled[tld] = true
 		}
 	}
 	for _, cfg := range resolver.AllChains() {
@@ -256,27 +247,44 @@ func run(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	slog.Info("initializing chain resolvers")
 	multiRes, warnings := resolver.InitAll(rpcOverrides, disabled)
 	for _, w := range warnings {
-		slog.Warn("resolver init", "warning", w)
+		fmt.Fprintf(os.Stderr, "  [!] %s\n", w)
 	}
-	for _, tld := range multiRes.EnabledTLDs() {
-		slog.Info("resolver enabled", "tld", tld)
+	// Display domains in a curated order: native TON first, then major chains, then the rest.
+	priority := map[string]int{
+		".ton": 0, ".t.me": 1, ".adnl": 2,
+		".eth": 3, ".sol": 4, ".btc": 5, ".bnb": 6,
+		".wallet": 7, ".nft": 8, ".crypto": 9,
 	}
+	tlds := append([]string{".ton", ".adnl", ".t.me"}, multiRes.EnabledTLDs()...)
+	sort.Slice(tlds, func(i, j int) bool {
+		pi, oki := priority[tlds[i]]
+		pj, okj := priority[tlds[j]]
+		if oki && okj {
+			return pi < pj
+		}
+		if oki {
+			return true
+		}
+		if okj {
+			return false
+		}
+		return tlds[i] < tlds[j]
+	})
+	fmt.Fprintf(os.Stderr, "  Domains:  %s\n", strings.Join(tlds, " "))
 
 	if directMode {
-		// Direct mode: connect directly to TON sites (no anonymity)
-		slog.Info("connecting to TON network")
+		fmt.Fprintf(os.Stderr, "  Connecting to TON network...\n")
 
 		directClient, err := direct.NewDirectClient(ctx, configPath, multiRes)
 		if err != nil {
-			slog.Error("failed to create direct client", "error", err)
+			fmt.Fprintf(os.Stderr, "  Error: %v\n", err)
 			os.Exit(1)
 		}
 
 		backend = directClient
-		slog.Info("mode: direct (no anonymity, faster)")
+		fmt.Fprintf(os.Stderr, "  Mode: direct (no anonymity, faster)\n")
 	} else {
 		// Circuit mode: 3-hop garlic routing (anonymous)
 
@@ -286,77 +294,75 @@ func run(cmd *cobra.Command, args []string) {
 		// Create ADNL gateway
 		gate = adnl.NewGateway(privateKey)
 		if err := gate.StartClient(); err != nil {
-			slog.Error("failed to start ADNL gateway", "error", err)
+			fmt.Fprintf(os.Stderr, "  Error: start ADNL gateway: %v\n", err)
 			os.Exit(1)
 		}
 
 		var circuit *client.ClientCircuit
 
 		if auto {
-			// Auto mode: fetch directory and build circuit with retry
-			slog.Info("loading community relays")
+			fmt.Fprintf(os.Stderr, "  Loading community relays...\n")
 
 			var err error
 			dir, err = directory.Fetch(directoryURL)
 			if err != nil {
-				slog.Error("failed to fetch directory", "error", err)
+				fmt.Fprintf(os.Stderr, "  Error: %v\n", err)
 				os.Exit(1)
 			}
 
-			slog.Info("relays found", "count", len(dir.Relays))
+			fmt.Fprintf(os.Stderr, "  Relays: %d available\n", len(dir.Relays))
 
 			circuit, err = buildCircuitWithRetry(ctx, gate, dir, retries)
 			if err != nil {
-				slog.Error("circuit build failed", "error", err)
+				fmt.Fprintf(os.Stderr, "  Error: circuit build failed: %v\n", err)
 				os.Exit(1)
 			}
 		} else {
 			// Manual mode: use provided relay flags
 			if relay1 == "" || relay2 == "" || relay3 == "" {
-				slog.Error("use --auto, --direct, or provide --relay1, --relay2, --relay3")
+				fmt.Fprintf(os.Stderr, "  Error: use --auto, --direct, or provide --relay1, --relay2, --relay3\n")
 				os.Exit(1)
 			}
 
 			r1, err := parseRelay(relay1)
 			if err != nil {
-				slog.Error("invalid relay1", "error", err)
+				fmt.Fprintf(os.Stderr, "  Error: invalid relay1: %v\n", err)
 				os.Exit(1)
 			}
 
 			r2, err := parseRelay(relay2)
 			if err != nil {
-				slog.Error("invalid relay2", "error", err)
+				fmt.Fprintf(os.Stderr, "  Error: invalid relay2: %v\n", err)
 				os.Exit(1)
 			}
 
 			r3, err := parseRelay(relay3)
 			if err != nil {
-				slog.Error("invalid relay3", "error", err)
+				fmt.Fprintf(os.Stderr, "  Error: invalid relay3: %v\n", err)
 				os.Exit(1)
 			}
 
 			relays := []client.RelayInfo{r1, r2, r3}
 
-			slog.Info("building circuit", "entry", r1.Address, "middle", r2.Address, "exit", r3.Address)
+			fmt.Fprintf(os.Stderr, "  Building circuit: %s -> %s -> %s\n", r1.Address, r2.Address, r3.Address)
 
 			circuit, err = client.NewClientCircuit(ctx, gate, relays)
 			if err != nil {
-				slog.Error("failed to create circuit", "error", err)
+				fmt.Fprintf(os.Stderr, "  Error: %v\n", err)
 				os.Exit(1)
 			}
 		}
 
 		backend = circuit
-		slog.Info("circuit ready", "id", hex.EncodeToString(circuit.ID)[:8])
-		slog.Info("mode: anonymous (3-hop garlic circuit)")
+		fmt.Fprintf(os.Stderr, "  Circuit: %s (3-hop garlic)\n", hex.EncodeToString(circuit.ID)[:8])
+		fmt.Fprintf(os.Stderr, "  Mode: anonymous\n")
 	}
 
-	// Show rotation status
 	if rotateInterval > 0 {
-		slog.Info("circuit rotation enabled", "interval", rotateInterval)
+		fmt.Fprintf(os.Stderr, "  Rotation: every %s\n", rotateInterval)
 	}
 
-	slog.Info("proxy listening", "addr", listen)
+	fmt.Fprintf(os.Stderr, "\n  Listening on %s\n\n", listen)
 
 	// Create proxy handler
 	handler := proxy.NewProxyHandler(proxy.HandlerConfig{
@@ -380,6 +386,8 @@ func run(cmd *cobra.Command, args []string) {
 		Addr:              listen,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      120 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 
@@ -397,6 +405,9 @@ func run(cmd *cobra.Command, args []string) {
 		if b := handler.Backend(); b != nil {
 			b.Close()
 		}
+		if gate != nil {
+			gate.Close()
+		}
 		multiRes.Close()
 		resolver.CloseSharedUDClient()
 	}
@@ -405,16 +416,16 @@ func run(cmd *cobra.Command, args []string) {
 	select {
 	case err := <-serverErr:
 		if err != nil {
-			slog.Error("HTTP server error", "error", err)
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			shutdown()
 			os.Exit(1)
 		}
 	case <-ctx.Done():
-		slog.Info("shutting down")
+		fmt.Fprintf(os.Stderr, "\n  Shutting down...\n")
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutdownCancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
-			slog.Error("graceful shutdown failed", "error", err)
+			fmt.Fprintf(os.Stderr, "  Error: graceful shutdown: %v\n", err)
 		}
 		shutdown()
 	}
