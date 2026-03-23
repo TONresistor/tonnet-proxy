@@ -8,3 +8,4 @@ bin/
 *.swo
 .DS_Store
 tonnet-proxy
+.obsidian/
