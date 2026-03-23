@@ -26,6 +26,4 @@ linters-settings:
       - ifElseChain
       - nestingReduce
 
-issues:
-  exclude-dirs:
-    - internal/tunnel  # inherited code, don't lint yet
+issues: {}
