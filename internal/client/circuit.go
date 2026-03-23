@@ -31,7 +31,6 @@ type ClientCircuit struct {
 	SharedKeys [][]byte  // One key per hop (entry, middle, exit)
 	entryPeer  adnl.Peer // Connection to the first relay
 
-	streams    sync.Map
 	nextStream uint32
 
 	// Pending responses by stream ID
@@ -396,7 +395,7 @@ func (c *ClientCircuit) RecvData(ctx context.Context, streamID int) ([]byte, err
 	newChan := make(chan []byte, 10)
 	respChanI, _ := c.pending.LoadOrStore(streamID, newChan)
 
-	respChan := respChanI.(chan []byte)
+	respChan, _ := respChanI.(chan []byte)
 
 	timer := time.NewTimer(60 * time.Second)
 	defer timer.Stop()
@@ -430,23 +429,6 @@ func (c *ClientCircuit) encryptLayers(data []byte) ([]byte, error) {
 	return encrypted, nil
 }
 
-// decryptLayers decrypts all garlic layers
-// Order: entry key first, then middle, then exit (path order)
-func (c *ClientCircuit) decryptLayers(data []byte) ([]byte, error) {
-	decrypted := data
-
-	// Decrypt in path order: entry, middle, exit
-	for i := 0; i < len(c.SharedKeys); i++ {
-		var err error
-		decrypted, err = decryptPayload(decrypted, c.SharedKeys[i])
-		if err != nil {
-			return nil, fmt.Errorf("decrypt layer %d: %w", i, err)
-		}
-	}
-
-	return decrypted, nil
-}
-
 // HandleResponse processes a response received from the circuit
 func (c *ClientCircuit) HandleResponse(data []byte) error {
 	// Responses are encrypted with exit key only (relays forward without re-encrypting)
@@ -474,22 +456,22 @@ func (c *ClientCircuit) HandleResponse(data []byte) error {
 	switch m := msg.(type) {
 	case *protocol.StreamConnected:
 		if ch, ok := c.pending.Load(m.StreamID); ok {
-			sendWithTimeout(ch.(chan []byte), decrypted, m.StreamID)
+			if c, ok := ch.(chan []byte); ok { sendWithTimeout(c, decrypted, m.StreamID) }
 		}
 
 	case protocol.StreamConnected:
 		if ch, ok := c.pending.Load(m.StreamID); ok {
-			sendWithTimeout(ch.(chan []byte), decrypted, m.StreamID)
+			if c, ok := ch.(chan []byte); ok { sendWithTimeout(c, decrypted, m.StreamID) }
 		}
 
 	case *protocol.StreamData:
 		if ch, ok := c.pending.Load(m.StreamID); ok {
-			sendWithTimeout(ch.(chan []byte), m.Data, m.StreamID)
+			if c, ok := ch.(chan []byte); ok { sendWithTimeout(c, m.Data, m.StreamID) }
 		}
 
 	case protocol.StreamData:
 		if ch, ok := c.pending.Load(m.StreamID); ok {
-			sendWithTimeout(ch.(chan []byte), m.Data, m.StreamID)
+			if c, ok := ch.(chan []byte); ok { sendWithTimeout(c, m.Data, m.StreamID) }
 		}
 	}
 
@@ -591,11 +573,11 @@ func (c *ClientCircuit) handleChunk(chunk *protocol.DataChunk) error {
 	switch m := msg.(type) {
 	case *protocol.StreamData:
 		if ch, ok := c.pending.Load(m.StreamID); ok {
-			sendWithTimeout(ch.(chan []byte), m.Data, m.StreamID)
+			if c, ok := ch.(chan []byte); ok { sendWithTimeout(c, m.Data, m.StreamID) }
 		}
 	case protocol.StreamData:
 		if ch, ok := c.pending.Load(m.StreamID); ok {
-			sendWithTimeout(ch.(chan []byte), m.Data, m.StreamID)
+			if c, ok := ch.(chan []byte); ok { sendWithTimeout(c, m.Data, m.StreamID) }
 		}
 	}
 

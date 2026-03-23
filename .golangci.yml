@@ -25,5 +25,7 @@ linters-settings:
       - dupImport
       - ifElseChain
       - nestingReduce
+    disabled-checks:
+      - exitAfterDefer  # CLI tool: os.Exit after defer is intentional
 
 issues: {}

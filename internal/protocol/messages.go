@@ -68,8 +68,8 @@ type CircuitExtend struct {
 // ExtendPayload is the encrypted content of CircuitExtend
 // Contains: next relay address + CircuitCreate for next relay
 type ExtendPayload struct {
-	NextAddr  string `tl:"string"`  // ip:port of next relay
-	ClientKey []byte `tl:"int256"`  // X25519 public key for next hop
+	NextAddr  string `tl:"string"` // ip:port of next relay
+	ClientKey []byte `tl:"int256"` // X25519 public key for next hop
 }
 
 // CircuitExtended confirms circuit extension
@@ -175,7 +175,7 @@ type StreamClose struct {
 type DataChunk struct {
 	CircuitID   []byte `tl:"int256"`
 	StreamID    int    `tl:"int"`
-	ChunkIndex  int    `tl:"int"`  // 0-indexed chunk number
-	TotalChunks int    `tl:"int"`  // Total number of chunks
+	ChunkIndex  int    `tl:"int"`   // 0-indexed chunk number
+	TotalChunks int    `tl:"int"`   // Total number of chunks
 	Data        []byte `tl:"bytes"` // Chunk payload (encrypted)
 }

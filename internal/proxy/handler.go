@@ -6,11 +6,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -290,7 +291,9 @@ func (h *ProxyHandler) StartRotation(ctx context.Context) {
 	for {
 		// Add ±jitterPercent% jitter to prevent timing attacks.
 		jitterRange := int64(h.rotateInterval) * 2 * jitterPercent / 100
-		jitter := time.Duration(rand.Int63n(jitterRange))
+		var rb [8]byte
+		_, _ = cryptorand.Read(rb[:])
+		jitter := time.Duration(int64(binary.BigEndian.Uint64(rb[:])) % jitterRange) //nolint:gosec // bounded
 		delay := h.rotateInterval - (h.rotateInterval * jitterPercent / 100) + jitter
 
 		timer := time.NewTimer(delay)

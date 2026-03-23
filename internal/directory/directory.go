@@ -187,6 +187,8 @@ func cryptoRandInt(n int) int {
 		return 0
 	}
 	var b [8]byte
-	rand.Read(b[:])
-	return int(binary.BigEndian.Uint64(b[:]) % uint64(n))
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0
+	}
+	return int(binary.BigEndian.Uint64(b[:]) % uint64(n)) //nolint:gosec // bounded by modulo
 }
