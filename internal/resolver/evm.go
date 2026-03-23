@@ -15,8 +15,8 @@ const (
 
 // evmChainIDs maps TLD suffixes to their expected EVM chain IDs.
 var evmChainIDs = map[string]int64{
-	".eth": 1,
-	".bnb": 56,
+	".eth":    1,
+	".bnb":    56,
 	".crypto": 137, ".x": 137, ".wallet": 137, ".nft": 137,
 	".dao": 137, ".blockchain": 137, ".bitcoin": 137, ".zil": 137,
 }

@@ -15,11 +15,11 @@ import (
 
 // Space ID registry and resolver addresses per chain
 type spaceIDChain struct {
-	TLD             string
-	Name            string
-	RegistryAddr    string
-	PublicResolver  string
-	DefaultRPCs     []string
+	TLD            string
+	Name           string
+	RegistryAddr   string
+	PublicResolver string
+	DefaultRPCs    []string
 }
 
 var spaceIDChains = []spaceIDChain{
@@ -117,7 +117,10 @@ func (r *SpaceIDResolver) Resolve(domain string) (string, error) {
 		return "", fmt.Errorf("unpack result for %q: %w", domain, err)
 	}
 
-	adnlAddr := output[0].(string)
+	adnlAddr, ok := output[0].(string)
+	if !ok {
+		return "", fmt.Errorf("unexpected result type for %q", domain)
+	}
 	if adnlAddr == "" {
 		return "", fmt.Errorf("no ADNL record set for %q", domain)
 	}

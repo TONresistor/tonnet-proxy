@@ -18,7 +18,7 @@ type ProxyConfig struct {
 	Rotate       string            `yaml:"rotate"`
 	Debug        bool              `yaml:"debug"`
 	RPC          map[string]string `yaml:"rpc"`      // ".eth": "https://...", ".sol": "https://..."
-	Disabled     []string          `yaml:"disabled"`  // [".btc", ".zil"]
+	Disabled     []string          `yaml:"disabled"` // [".btc", ".zil"]
 }
 
 // Load reads a YAML config file from path and returns the parsed ProxyConfig.

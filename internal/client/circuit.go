@@ -43,8 +43,8 @@ type ClientCircuit struct {
 
 // Limits for chunk reassembly (Findings #24, #25).
 const (
-	maxChunkCount    = 1024             // Maximum number of chunks per stream
-	maxChunkTotalSize = 100 * 1024 * 1024 // 100 MB maximum reassembled size
+	maxChunkCount        = 1024              // Maximum number of chunks per stream
+	maxChunkTotalSize    = 100 * 1024 * 1024 // 100 MB maximum reassembled size
 	chunkAssemblyTimeout = 60 * time.Second
 )
 
@@ -456,22 +456,30 @@ func (c *ClientCircuit) HandleResponse(data []byte) error {
 	switch m := msg.(type) {
 	case *protocol.StreamConnected:
 		if ch, ok := c.pending.Load(m.StreamID); ok {
-			if c, ok := ch.(chan []byte); ok { sendWithTimeout(c, decrypted, m.StreamID) }
+			if c, ok := ch.(chan []byte); ok {
+				sendWithTimeout(c, decrypted, m.StreamID)
+			}
 		}
 
 	case protocol.StreamConnected:
 		if ch, ok := c.pending.Load(m.StreamID); ok {
-			if c, ok := ch.(chan []byte); ok { sendWithTimeout(c, decrypted, m.StreamID) }
+			if c, ok := ch.(chan []byte); ok {
+				sendWithTimeout(c, decrypted, m.StreamID)
+			}
 		}
 
 	case *protocol.StreamData:
 		if ch, ok := c.pending.Load(m.StreamID); ok {
-			if c, ok := ch.(chan []byte); ok { sendWithTimeout(c, m.Data, m.StreamID) }
+			if c, ok := ch.(chan []byte); ok {
+				sendWithTimeout(c, m.Data, m.StreamID)
+			}
 		}
 
 	case protocol.StreamData:
 		if ch, ok := c.pending.Load(m.StreamID); ok {
-			if c, ok := ch.(chan []byte); ok { sendWithTimeout(c, m.Data, m.StreamID) }
+			if c, ok := ch.(chan []byte); ok {
+				sendWithTimeout(c, m.Data, m.StreamID)
+			}
 		}
 	}
 
@@ -573,11 +581,15 @@ func (c *ClientCircuit) handleChunk(chunk *protocol.DataChunk) error {
 	switch m := msg.(type) {
 	case *protocol.StreamData:
 		if ch, ok := c.pending.Load(m.StreamID); ok {
-			if c, ok := ch.(chan []byte); ok { sendWithTimeout(c, m.Data, m.StreamID) }
+			if c, ok := ch.(chan []byte); ok {
+				sendWithTimeout(c, m.Data, m.StreamID)
+			}
 		}
 	case protocol.StreamData:
 		if ch, ok := c.pending.Load(m.StreamID); ok {
-			if c, ok := ch.(chan []byte); ok { sendWithTimeout(c, m.Data, m.StreamID) }
+			if c, ok := ch.(chan []byte); ok {
+				sendWithTimeout(c, m.Data, m.StreamID)
+			}
 		}
 	}
 

@@ -130,7 +130,10 @@ func (r *UDResolver) Resolve(domain string) (string, error) {
 		return "", fmt.Errorf("unpack result for %q: %w", domain, err)
 	}
 
-	values := output[0].([]string)
+	values, ok := output[0].([]string)
+	if !ok {
+		return "", fmt.Errorf("unexpected result type for %q", domain)
+	}
 	if len(values) == 0 || values[0] == "" {
 		return "", fmt.Errorf("no ADNL record set for %q", domain)
 	}

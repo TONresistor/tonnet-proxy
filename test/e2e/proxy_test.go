@@ -878,7 +878,7 @@ func TestE2E_ProxyAsHTTPClient(t *testing.T) {
 
 	// Verify the proxy doesn't inject blocking headers that break the response.
 	if ct := resp.Header.Get("Content-Type"); ct == "" {
-		t.Fatalf("FAIL: Content-Type header missing from proxied response\n"+
+		t.Fatalf("FAIL: Content-Type header missing from proxied response\n" +
 			"  The proxy may be stripping essential response headers")
 	}
 

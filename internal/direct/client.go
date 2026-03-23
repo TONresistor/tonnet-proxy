@@ -162,7 +162,10 @@ func (c *DirectClient) SendData(ctx context.Context, streamID int, data []byte) 
 	if !ok {
 		return fmt.Errorf("stream %d not found", streamID)
 	}
-	s := si.(*stream)
+	s, ok := si.(*stream)
+	if !ok {
+		return fmt.Errorf("stream %d: invalid type", streamID)
+	}
 
 	streamCtx, cancel := context.WithCancel(ctx)
 	s.mu.Lock()
@@ -313,7 +316,10 @@ func (c *DirectClient) RecvData(ctx context.Context, streamID int) ([]byte, erro
 	if !ok {
 		return nil, fmt.Errorf("stream %d not found", streamID)
 	}
-	s := si.(*stream)
+	s, ok := si.(*stream)
+	if !ok {
+		return nil, fmt.Errorf("stream %d: invalid type", streamID)
+	}
 
 	timer := time.NewTimer(60 * time.Second)
 	defer timer.Stop()
@@ -331,7 +337,10 @@ func (c *DirectClient) RecvData(ctx context.Context, streamID int) ([]byte, erro
 // CloseStream closes a specific stream
 func (c *DirectClient) CloseStream(streamID int) {
 	if si, ok := c.streams.LoadAndDelete(streamID); ok {
-		s := si.(*stream)
+		s, _ := si.(*stream)
+		if s == nil {
+			return
+		}
 		s.mu.Lock()
 		if s.cancel != nil {
 			s.cancel()
@@ -351,4 +360,3 @@ func (c *DirectClient) Close() error {
 	}
 	return nil
 }
-

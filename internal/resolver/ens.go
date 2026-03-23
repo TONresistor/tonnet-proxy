@@ -67,4 +67,3 @@ func (r *ENSResolver) Resolve(domain string) (string, error) {
 func (r *ENSResolver) Close() {
 	r.client.Close()
 }
-
