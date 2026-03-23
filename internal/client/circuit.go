@@ -1,20 +1,22 @@
 package client
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/TONresistor/tonnet-proxy/internal/protocol"
+	"github.com/adnl-network/adnl-proxy/internal/protocol"
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/tl"
 	"golang.org/x/crypto/chacha20poly1305"
-	"golang.org/x/crypto/curve25519"
 )
 
 // RelayInfo contains the address and public key of a relay
@@ -40,10 +42,19 @@ type ClientCircuit struct {
 	chunks   map[int]*chunkAssembler // streamID -> assembler
 }
 
+// Limits for chunk reassembly (Findings #24, #25).
+const (
+	maxChunkCount    = 1024             // Maximum number of chunks per stream
+	maxChunkTotalSize = 100 * 1024 * 1024 // 100 MB maximum reassembled size
+	chunkAssemblyTimeout = 60 * time.Second
+)
+
 // chunkAssembler collects and reassembles chunked responses
 type chunkAssembler struct {
 	totalChunks int
 	received    map[int][]byte // chunkIndex -> decrypted data
+	createdAt   time.Time      // For timeout enforcement (Finding #24)
+	totalSize   int            // Running total of received bytes (Finding #24)
 }
 
 // NewClientCircuit creates a circuit through 3 relays
@@ -70,6 +81,19 @@ func NewClientCircuit(ctx context.Context, gate *adnl.Gateway, relays []RelayInf
 		return nil, fmt.Errorf("connect to entry relay: %w", err)
 	}
 	circuit.entryPeer = entryPeer
+
+	// Finding #2: Track build success; tear down established hops on partial failure.
+	buildSucceeded := false
+	defer func() {
+		if !buildSucceeded && circuit.entryPeer != nil {
+			// Send CircuitDestroy to tear down any partially established hops.
+			destroyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = circuit.entryPeer.SendCustomMessage(destroyCtx, &protocol.CircuitDestroy{
+				CircuitID: circuit.ID,
+			})
+		}
+	}()
 
 	// Register handler for incoming Data and DataChunk messages (responses from circuit)
 	entryPeer.SetCustomMessageHandler(func(msg *adnl.MessageCustom) error {
@@ -126,6 +150,7 @@ func NewClientCircuit(ctx context.Context, gate *adnl.Gateway, relays []RelayInf
 	}
 	circuit.SharedKeys[2] = key3
 
+	buildSucceeded = true
 	return circuit, nil
 }
 
@@ -146,7 +171,10 @@ func (c *ClientCircuit) createCircuit(ctx context.Context, relay RelayInfo) ([]b
 	}
 
 	// Compute shared key
-	sharedKey := computeSharedKey(clientPriv, resp.RelayKey)
+	sharedKey, err := computeSharedKey(clientPriv, resp.RelayKey)
+	if err != nil {
+		return nil, fmt.Errorf("compute shared key: %w", err)
+	}
 
 	return sharedKey, nil
 }
@@ -183,7 +211,10 @@ func (c *ClientCircuit) extendCircuit(ctx context.Context, relay RelayInfo) ([]b
 	}
 
 	// Compute shared key with middle relay
-	sharedKey := computeSharedKey(clientPriv, resp.RelayKey)
+	sharedKey, err := computeSharedKey(clientPriv, resp.RelayKey)
+	if err != nil {
+		return nil, fmt.Errorf("compute shared key: %w", err)
+	}
 
 	return sharedKey, nil
 }
@@ -250,14 +281,28 @@ func (c *ClientCircuit) extendCircuitViaRelay(ctx context.Context, relay RelayIn
 	}
 
 	// Compute shared key with exit relay
-	sharedKey := computeSharedKey(clientPriv, extendedResp.RelayKey)
+	sharedKey, err := computeSharedKey(clientPriv, extendedResp.RelayKey)
+	if err != nil {
+		return nil, fmt.Errorf("compute shared key: %w", err)
+	}
 
 	return sharedKey, nil
 }
 
+// nextStreamID atomically increments the stream counter and skips 0
+// (reserved for the control stream) on uint32 wraparound.
+func (c *ClientCircuit) nextStreamID() int {
+	for {
+		id := atomic.AddUint32(&c.nextStream, 1)
+		if id != 0 {
+			return int(id)
+		}
+	}
+}
+
 // OpenStream opens a new stream to the specified host:port
 func (c *ClientCircuit) OpenStream(ctx context.Context, host string, port int) (int, error) {
-	streamID := int(atomic.AddUint32(&c.nextStream, 1))
+	streamID := c.nextStreamID()
 
 	// Create StreamConnect message
 	connect := &protocol.StreamConnect{
@@ -273,11 +318,17 @@ func (c *ClientCircuit) OpenStream(ctx context.Context, host string, port int) (
 	}
 
 	// Encrypt in layers (reverse order: exit, middle, entry)
-	encrypted := c.encryptLayers(payload)
+	encrypted, err := c.encryptLayers(payload)
+	if err != nil {
+		return 0, fmt.Errorf("encrypt stream connect: %w", err)
+	}
 
-	// Create response channel
+	// Create response channel and register atomically to avoid TOCTOU race.
 	respChan := make(chan []byte, 1)
-	c.pending.Store(streamID, respChan)
+	if _, loaded := c.pending.LoadOrStore(streamID, respChan); loaded {
+		// Another goroutine already registered this stream ID; use existing channel.
+		return 0, fmt.Errorf("stream ID %d already pending", streamID)
+	}
 
 	// Send via circuit
 	err = c.entryPeer.SendCustomMessage(ctx, &protocol.Data{
@@ -291,6 +342,9 @@ func (c *ClientCircuit) OpenStream(ctx context.Context, host string, port int) (
 	}
 
 	// Wait for confirmation
+	timer := time.NewTimer(30 * time.Second)
+	defer timer.Stop()
+
 	select {
 	case resp := <-respChan:
 		var connected protocol.StreamConnected
@@ -302,7 +356,7 @@ func (c *ClientCircuit) OpenStream(ctx context.Context, host string, port int) (
 		}
 		return streamID, nil
 
-	case <-time.After(30 * time.Second):
+	case <-timer.C:
 		c.pending.Delete(streamID)
 		return 0, fmt.Errorf("timeout waiting for stream connect response")
 
@@ -324,7 +378,10 @@ func (c *ClientCircuit) SendData(ctx context.Context, streamID int, data []byte)
 		return fmt.Errorf("serialize stream data: %w", err)
 	}
 
-	encrypted := c.encryptLayers(payload)
+	encrypted, err := c.encryptLayers(payload)
+	if err != nil {
+		return fmt.Errorf("encrypt stream data: %w", err)
+	}
 
 	return c.entryPeer.SendCustomMessage(ctx, &protocol.Data{
 		CircuitID: c.ID,
@@ -335,20 +392,20 @@ func (c *ClientCircuit) SendData(ctx context.Context, streamID int, data []byte)
 
 // RecvData waits for and returns data from a stream
 func (c *ClientCircuit) RecvData(ctx context.Context, streamID int) ([]byte, error) {
-	respChanI, ok := c.pending.Load(streamID)
-	if !ok {
-		respChan := make(chan []byte, 10)
-		c.pending.Store(streamID, respChan)
-		respChanI = respChan
-	}
+	// Finding #8: Use LoadOrStore to avoid TOCTOU race between Load and Store.
+	newChan := make(chan []byte, 10)
+	respChanI, _ := c.pending.LoadOrStore(streamID, newChan)
 
 	respChan := respChanI.(chan []byte)
+
+	timer := time.NewTimer(60 * time.Second)
+	defer timer.Stop()
 
 	select {
 	case data := <-respChan:
 		return data, nil
 
-	case <-time.After(60 * time.Second):
+	case <-timer.C:
 		return nil, fmt.Errorf("timeout waiting for stream data")
 
 	case <-ctx.Done():
@@ -356,9 +413,9 @@ func (c *ClientCircuit) RecvData(ctx context.Context, streamID int) ([]byte, err
 	}
 }
 
-// encryptLayers encrypts data with all layers (garlic encryption)
-// Order: exit key first, then middle, then entry (reverse path order)
-func (c *ClientCircuit) encryptLayers(data []byte) []byte {
+// encryptLayers encrypts data with all layers (garlic encryption).
+// Order: exit key first, then middle, then entry (reverse path order).
+func (c *ClientCircuit) encryptLayers(data []byte) ([]byte, error) {
 	encrypted := data
 
 	// Encrypt in reverse order: exit, middle, entry
@@ -366,12 +423,11 @@ func (c *ClientCircuit) encryptLayers(data []byte) []byte {
 		var err error
 		encrypted, err = encryptPayload(encrypted, c.SharedKeys[i])
 		if err != nil {
-			// In production, handle this error properly
-			panic(fmt.Sprintf("encrypt layer %d: %v", i, err))
+			return nil, fmt.Errorf("encrypt layer %d: %w", i, err)
 		}
 	}
 
-	return encrypted
+	return encrypted, nil
 }
 
 // decryptLayers decrypts all garlic layers
@@ -406,37 +462,34 @@ func (c *ClientCircuit) HandleResponse(data []byte) error {
 		return fmt.Errorf("parse response: %w", err)
 	}
 
+	// Finding #9: Use a short timeout instead of silently dropping data.
+	sendWithTimeout := func(ch chan []byte, data []byte, streamID int) {
+		select {
+		case ch <- data:
+		case <-time.After(5 * time.Second):
+			log.Printf("circuit: stream %d response channel full, dropping %d bytes", streamID, len(data))
+		}
+	}
+
 	switch m := msg.(type) {
 	case *protocol.StreamConnected:
 		if ch, ok := c.pending.Load(m.StreamID); ok {
-			select {
-			case ch.(chan []byte) <- decrypted:
-			default:
-			}
+			sendWithTimeout(ch.(chan []byte), decrypted, m.StreamID)
 		}
 
 	case protocol.StreamConnected:
 		if ch, ok := c.pending.Load(m.StreamID); ok {
-			select {
-			case ch.(chan []byte) <- decrypted:
-			default:
-			}
+			sendWithTimeout(ch.(chan []byte), decrypted, m.StreamID)
 		}
 
 	case *protocol.StreamData:
 		if ch, ok := c.pending.Load(m.StreamID); ok {
-			select {
-			case ch.(chan []byte) <- m.Data:
-			default:
-			}
+			sendWithTimeout(ch.(chan []byte), m.Data, m.StreamID)
 		}
 
 	case protocol.StreamData:
 		if ch, ok := c.pending.Load(m.StreamID); ok {
-			select {
-			case ch.(chan []byte) <- m.Data:
-			default:
-			}
+			sendWithTimeout(ch.(chan []byte), m.Data, m.StreamID)
 		}
 	}
 
@@ -446,6 +499,16 @@ func (c *ClientCircuit) HandleResponse(data []byte) error {
 // handleChunk processes a chunked response from the circuit
 // Chunks are used for large responses that exceed ADNL's ~8KB limit
 func (c *ClientCircuit) handleChunk(chunk *protocol.DataChunk) error {
+	// Finding #25: Reject TotalChunks=0 as invalid.
+	if chunk.TotalChunks == 0 {
+		return fmt.Errorf("invalid chunk: TotalChunks=0")
+	}
+
+	// Finding #24: Enforce max chunk count.
+	if chunk.TotalChunks > maxChunkCount {
+		return fmt.Errorf("chunk count %d exceeds maximum %d", chunk.TotalChunks, maxChunkCount)
+	}
+
 	// Decrypt this chunk with exit key
 	decrypted, err := decryptPayload(chunk.Data, c.SharedKeys[len(c.SharedKeys)-1])
 	if err != nil {
@@ -461,12 +524,31 @@ func (c *ClientCircuit) handleChunk(chunk *protocol.DataChunk) error {
 		assembler = &chunkAssembler{
 			totalChunks: chunk.TotalChunks,
 			received:    make(map[int][]byte),
+			createdAt:   time.Now(),
 		}
 		c.chunks[chunk.StreamID] = assembler
 	}
 
+	// Finding #24: Enforce reassembly timeout.
+	if time.Since(assembler.createdAt) > chunkAssemblyTimeout {
+		delete(c.chunks, chunk.StreamID)
+		return fmt.Errorf("chunk assembly for stream %d timed out", chunk.StreamID)
+	}
+
+	// Finding #26: Skip duplicate chunks (keep first received).
+	if _, exists := assembler.received[chunk.ChunkIndex]; exists {
+		return nil
+	}
+
+	// Finding #24: Enforce max total size.
+	if assembler.totalSize+len(decrypted) > maxChunkTotalSize {
+		delete(c.chunks, chunk.StreamID)
+		return fmt.Errorf("chunk reassembly for stream %d exceeds maximum size %d", chunk.StreamID, maxChunkTotalSize)
+	}
+
 	// Store this chunk
 	assembler.received[chunk.ChunkIndex] = decrypted
+	assembler.totalSize += len(decrypted)
 
 	// Check if all chunks received
 	if len(assembler.received) < assembler.totalChunks {
@@ -497,20 +579,23 @@ func (c *ClientCircuit) handleChunk(chunk *protocol.DataChunk) error {
 		return fmt.Errorf("parse reassembled response: %w", err)
 	}
 
+	// Finding #9: Use a short timeout instead of silently dropping reassembled data.
+	sendWithTimeout := func(ch chan []byte, data []byte, streamID int) {
+		select {
+		case ch <- data:
+		case <-time.After(5 * time.Second):
+			log.Printf("circuit: stream %d chunk channel full, dropping %d bytes", streamID, len(data))
+		}
+	}
+
 	switch m := msg.(type) {
 	case *protocol.StreamData:
 		if ch, ok := c.pending.Load(m.StreamID); ok {
-			select {
-			case ch.(chan []byte) <- m.Data:
-			default:
-			}
+			sendWithTimeout(ch.(chan []byte), m.Data, m.StreamID)
 		}
 	case protocol.StreamData:
 		if ch, ok := c.pending.Load(m.StreamID); ok {
-			select {
-			case ch.(chan []byte) <- m.Data:
-			default:
-			}
+			sendWithTimeout(ch.(chan []byte), m.Data, m.StreamID)
 		}
 	}
 
@@ -525,7 +610,10 @@ func (c *ClientCircuit) CloseStream(streamID int) {
 // Close closes the circuit
 func (c *ClientCircuit) Close() error {
 	if c.entryPeer != nil {
-		return c.entryPeer.SendCustomMessage(context.Background(), &protocol.CircuitDestroy{
+		// Finding #27: Use a bounded context instead of context.Background().
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return c.entryPeer.SendCustomMessage(ctx, &protocol.CircuitDestroy{
 			CircuitID: c.ID,
 		})
 	}
@@ -534,37 +622,46 @@ func (c *ClientCircuit) Close() error {
 
 // --- Crypto helpers (same pattern as internal/exit/crypto.go) ---
 
-// generateX25519Keypair generates an X25519 keypair for key exchange
+// generateX25519Keypair generates an X25519 keypair for key exchange.
+// Finding #42: Uses crypto/ecdh instead of deprecated curve25519.ScalarBaseMult.
 func generateX25519Keypair() ([]byte, []byte) {
-	var priv, pub [32]byte
-
-	if _, err := rand.Read(priv[:]); err != nil {
+	privKey, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
 		panic(err)
 	}
-
-	// Clamp private key for X25519
-	priv[0] &= 248
-	priv[31] &= 127
-	priv[31] |= 64
-
-	curve25519.ScalarBaseMult(&pub, &priv)
-
-	return priv[:], pub[:]
+	return privKey.Bytes(), privKey.PublicKey().Bytes()
 }
 
-// computeSharedKey computes the shared secret from X25519 key exchange
-func computeSharedKey(privKey, peerPubKey []byte) []byte {
-	var priv, peerPub, shared [32]byte
+// computeSharedKey computes the shared secret from X25519 key exchange.
+// Finding #42: Uses crypto/ecdh instead of deprecated curve25519.ScalarMult.
+// Finding #43: Validates that the shared secret is not all zeros (low-order point check).
+func computeSharedKey(privKeyBytes, peerPubKeyBytes []byte) ([]byte, error) {
+	curve := ecdh.X25519()
 
-	copy(priv[:], privKey)
-	copy(peerPub[:], peerPubKey)
+	privKey, err := curve.NewPrivateKey(privKeyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("computeSharedKey: invalid private key: %w", err)
+	}
 
-	curve25519.ScalarMult(&shared, &priv, &peerPub)
+	peerPub, err := curve.NewPublicKey(peerPubKeyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("computeSharedKey: invalid peer public key: %w", err)
+	}
+
+	shared, err := privKey.ECDH(peerPub)
+	if err != nil {
+		return nil, fmt.Errorf("computeSharedKey: ECDH failed: %w", err)
+	}
+
+	// Finding #43: Reject low-order points that produce an all-zeros shared secret.
+	if bytes.Equal(shared, make([]byte, len(shared))) {
+		return nil, fmt.Errorf("computeSharedKey: shared secret is all zeros (low-order point)")
+	}
 
 	// Derive symmetric key from shared secret using SHA256
 	h := sha256.New()
-	h.Write(shared[:])
-	return h.Sum(nil)
+	h.Write(shared)
+	return h.Sum(nil), nil
 }
 
 // encryptPayload encrypts data with ChaCha20-Poly1305 (nonce prepended)

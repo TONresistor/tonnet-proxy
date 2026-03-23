@@ -5,11 +5,56 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version override (e.g. v0.6.0). Defaults to git tag.'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  GO_VERSION: '1.24'
+  BINARY: tonnet-proxy
 
 jobs:
+  # ─── Quality gate ──────────────────────────────────────────────
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+  # ─── Build matrix (Linux, Windows, Android) ────────────────────
   build:
+    needs: [test, lint]
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
           - goos: linux
@@ -21,17 +66,30 @@ jobs:
           - goos: windows
             goarch: amd64
             suffix: windows-amd64.exe
+          - goos: windows
+            goarch: arm64
+            suffix: windows-arm64.exe
           - goos: android
             goarch: arm64
             suffix: android-arm64
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: '1.21'
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${GITHUB_REF_NAME}" ] && echo "${GITHUB_REF_NAME}" | grep -qE '^v[0-9]'; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$(git describe --tags --always --dirty)" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build
         env:
@@ -39,65 +97,82 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
         run: |
-          VERSION=${GITHUB_REF#refs/tags/}
-          go build -ldflags "-X main.version=${VERSION} -s -w" -o tonnet-proxy-${{ matrix.suffix }} ./cmd/
+          go build \
+            -ldflags "-X main.version=${{ steps.version.outputs.version }} -s -w" \
+            -trimpath \
+            -o ${{ env.BINARY }}-${{ matrix.suffix }} \
+            ./cmd/main.go
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: tonnet-proxy-${{ matrix.suffix }}
-          path: tonnet-proxy-${{ matrix.suffix }}
+          name: ${{ env.BINARY }}-${{ matrix.suffix }}
+          path: ${{ env.BINARY }}-${{ matrix.suffix }}
+          if-no-files-found: error
 
+  # ─── macOS universal binary ────────────────────────────────────
   build-macos:
+    needs: [test, lint]
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: '1.21'
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${GITHUB_REF_NAME}" ] && echo "${GITHUB_REF_NAME}" | grep -qE '^v[0-9]'; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$(git describe --tags --always --dirty)" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build universal binary
         run: |
-          VERSION=${GITHUB_REF#refs/tags/}
-          LDFLAGS="-X main.version=${VERSION} -s -w"
+          LDFLAGS="-X main.version=${{ steps.version.outputs.version }} -s -w"
 
-          # Build for both architectures
-          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o tonnet-proxy-darwin-amd64 ./cmd/
-          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags "${LDFLAGS}" -o tonnet-proxy-darwin-arm64 ./cmd/
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags "${LDFLAGS}" -trimpath -o ${{ env.BINARY }}-darwin-amd64 ./cmd/main.go
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags "${LDFLAGS}" -trimpath -o ${{ env.BINARY }}-darwin-arm64 ./cmd/main.go
 
-          # Create universal binary
-          lipo -create -output tonnet-proxy-darwin-universal tonnet-proxy-darwin-amd64 tonnet-proxy-darwin-arm64
+          lipo -create -output ${{ env.BINARY }}-darwin-universal ${{ env.BINARY }}-darwin-amd64 ${{ env.BINARY }}-darwin-arm64
 
-          # Verify
-          file tonnet-proxy-darwin-universal
+          file ${{ env.BINARY }}-darwin-universal
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: tonnet-proxy-darwin-universal
-          path: tonnet-proxy-darwin-universal
+          name: ${{ env.BINARY }}-darwin-universal
+          path: ${{ env.BINARY }}-darwin-universal
+          if-no-files-found: error
 
+  # ─── Release with checksums ────────────────────────────────────
   release:
     needs: [build, build-macos]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
 
-      - name: Prepare release files
+      - name: Prepare release files and generate checksums
         run: |
           mkdir -p release
           find artifacts -type f -exec mv {} release/ \;
-          ls -la release/
+
+          cd release
+          sha256sum * > checksums-sha256.txt
+          cat checksums-sha256.txt
+          ls -la
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
         with:
           files: release/*
           generate_release_notes: true
+          fail_on_unmatched_files: true

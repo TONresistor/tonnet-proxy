@@ -1,0 +1,29 @@
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck
+    - gosec
+    - gocritic
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
+    - gofmt
+    - goimports
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+  gosec:
+    excludes:
+      - G104  # we handle errors in defer
+  gocritic:
+    enabled-checks:
+      - dupImport
+      - ifElseChain
+      - nestingReduce
+
+issues: {}
