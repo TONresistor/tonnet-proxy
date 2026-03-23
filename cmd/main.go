@@ -6,6 +6,7 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -83,10 +84,13 @@ func buildCircuitWithRetry(ctx context.Context, gate *adnl.Gateway, dir *directo
 			continue
 		}
 
-		fmt.Fprintf(os.Stderr, "  Building circuit (attempt %d/%d)...\n", attempt, maxRetries)
-		fmt.Fprintf(os.Stderr, "    Entry:  %s (%s)\n", dir.GetRelayName(relays[0].Address), relays[0].Address)
-		fmt.Fprintf(os.Stderr, "    Middle: %s (%s)\n", dir.GetRelayName(relays[1].Address), relays[1].Address)
-		fmt.Fprintf(os.Stderr, "    Exit:   %s (%s)\n", dir.GetRelayName(relays[2].Address), relays[2].Address)
+		slog.Info("building circuit",
+			"attempt", attempt,
+			"max_retries", maxRetries,
+			"entry", dir.GetRelayName(relays[0].Address),
+			"middle", dir.GetRelayName(relays[1].Address),
+			"exit", dir.GetRelayName(relays[2].Address),
+		)
 
 		circuit, err := client.NewClientCircuit(ctx, gate, relays)
 		if err == nil {
@@ -94,7 +98,7 @@ func buildCircuitWithRetry(ctx context.Context, gate *adnl.Gateway, dir *directo
 		}
 
 		lastErr = err
-		fmt.Fprintf(os.Stderr, "    Failed: %v\n", err)
+		slog.Warn("circuit build failed", "attempt", attempt, "error", err)
 	}
 
 	return nil, fmt.Errorf("failed after %d attempts: %w", maxRetries, lastErr)

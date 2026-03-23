@@ -14,7 +14,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -133,13 +132,12 @@ func isTONNative(host string) bool {
 	return false
 }
 
-// logRequest prints a compact one-line request log to stderr.
+// logRequest logs an HTTP request via slog.
 func logRequest(method, path string, status int, elapsed time.Duration, err error) {
-	ts := time.Now().Format("15:04:05")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[%s] %s %s - %d (%.1fs) %v\n", ts, method, path, status, elapsed.Seconds(), err)
+		slog.Info("request", "method", method, "path", path, "status", status, "duration", elapsed, "error", err)
 	} else {
-		fmt.Fprintf(os.Stderr, "[%s] %s %s - %d (%.1fs)\n", ts, method, path, status, elapsed.Seconds())
+		slog.Info("request", "method", method, "path", path, "status", status, "duration", elapsed)
 	}
 }
 
